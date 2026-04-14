@@ -64,8 +64,8 @@ iPhone Camera + LiDAR
 
 | Model | Size | Input | Output |
 |-------|------|-------|--------|
-| **yolo11n** (fp16) | 5 MB | (1, 3, 640, 640) RGB | (1, 84, 8400) boxes + classes |
-| **BoxerNet** (fp16) | 191 MB | (1, 3, 960, 960) RGB + (1, 1, 60, 60) depth + (1, M, 4) boxes + (1, 3600, 6) rays | (M, 3) center, (M, 3) size, (M,) yaw, (M,) confidence |
+| **yolo11n** | 10 MB | (1, 3, 640, 640) RGB | (1, 84, 8400) boxes + classes |
+| **BoxerNet** | 391 MB | (1, 3, 960, 960) RGB + (1, 1, 60, 60) depth + (1, M, 4) boxes + (1, 3600, 6) rays | (M, 3) center, (M, 3) size, (M,) yaw, (M,) confidence |
 
 Both models run with ONNX Runtime CoreML Execution Provider for Metal/Neural Engine acceleration.
 
