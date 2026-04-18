@@ -1,0 +1,10 @@
+// Copy this file to Signing.xcconfig (gitignored) and fill in your own
+// values. Without a real Signing.xcconfig, the build will fail to sign.
+//
+//   cp Signing.xcconfig.template Signing.xcconfig
+//
+// Find your Team ID at https://developer.apple.com/account — it is the
+// 10-character string shown next to your name/team.
+
+DEVELOPMENT_TEAM = YOUR_TEAM_ID_HERE
+PRODUCT_BUNDLE_IDENTIFIER = com.yourdomain.Boxer3D

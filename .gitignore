@@ -1,6 +1,7 @@
 # Xcode
 *.xcodeproj/xcuserdata/
 *.xcodeproj/project.xcworkspace/xcuserdata/
+Signing.xcconfig
 DerivedData/
 *.hmap
 *.ipa
@@ -15,3 +16,11 @@ DerivedData/
 # ONNX models (too large for git — use Git LFS or download script)
 *.onnx
 *.pyc
+
+# HuggingFace download artifacts in boxer/
+boxer/.gitattributes
+boxer/.gitattributes.*
+boxer/README.md
+boxer/README.md.*
+boxer/*.onnx.lock
+boxer/*.onnx.metadata
