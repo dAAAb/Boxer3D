@@ -1,6 +1,13 @@
 import Foundation
 import OnnxRuntimeBindings
 
+private func yoloOptimizedModelPath() -> String {
+    let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("ort-optimized")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.appendingPathComponent("yolo11n.ort").path
+}
+
 /// YOLO detection result.
 struct YOLOBox {
     let xmin: Float
@@ -35,8 +42,15 @@ final class YOLODetector {
     init(modelPath: String) throws {
         env = try ORTEnv(loggingLevel: .warning)
         let opts = try ORTSessionOptions()
-        let coreMLOpts = ORTCoreMLExecutionProviderOptions()
-        try opts.appendCoreMLExecutionProvider(with: coreMLOpts)
+        try opts.setGraphOptimizationLevel(.all)
+        try opts.setOptimizedModelFilePath(yoloOptimizedModelPath())
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("coreml-yolo").path
+        try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
+        try opts.appendCoreMLExecutionProvider(withOptionsV2: [
+            "MLComputeUnits": "CPUAndGPU",
+            "ModelCacheDirectory": cacheDir,
+        ])
         session = try ORTSession(env: env, modelPath: modelPath, sessionOptions: opts)
     }
 

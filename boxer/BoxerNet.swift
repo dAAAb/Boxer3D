@@ -19,6 +19,13 @@ import Accelerate
 import simd
 import OnnxRuntimeBindings
 
+private func optimizedModelPath(for name: String) -> String {
+    let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("ort-optimized")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.appendingPathComponent("\(name).ort").path
+}
+
 // MARK: - Data Types
 
 /// A single 3D bounding box detection.
@@ -62,12 +69,29 @@ final class BoxerNet {
     static let gridW: Int = imageSize / patchSize  // 60
     static let numPatches: Int = gridH * gridW     // 3600
 
+    /// Fixed number of boxes this (static-shape) model expects per call.
+    /// Must match `num_boxes` used when exporting BoxerNet_static.onnx.
+    /// Unused slots get padded with zero boxes and their outputs are discarded.
+    /// CoreML requires static shapes to keep the graph from fragmenting into
+    /// hundreds of partitions, so some upper bound is mandatory.
+    static let numBoxes: Int = 3
+
     init(modelPath: String) throws {
         env = try ORTEnv(loggingLevel: .warning)
         let opts = try ORTSessionOptions()
-        // CoreML EP → Metal GPU / Neural Engine acceleration.
-        let coreMLOpts = ORTCoreMLExecutionProviderOptions()
-        try opts.appendCoreMLExecutionProvider(with: coreMLOpts)
+        try opts.setGraphOptimizationLevel(.all)
+        try opts.setOptimizedModelFilePath(optimizedModelPath(for: "BoxerNet"))
+        // Model is static-shape (num_boxes fixed at BoxerNet.numBoxes); RequireStaticInputShapes
+        // lets CoreML take the whole graph as one partition instead of ~150
+        // fragments. CPUAndGPU skips ANE conversion that OOMs on 400 MB model.
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("coreml-boxer").path
+        try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
+        try opts.appendCoreMLExecutionProvider(withOptionsV2: [
+            "MLComputeUnits": "CPUAndGPU",
+            "RequireStaticInputShapes": "1",
+            "ModelCacheDirectory": cacheDir,
+        ])
         session = try ORTSession(env: env, modelPath: modelPath, sessionOptions: opts)
     }
 
@@ -119,33 +143,35 @@ final class BoxerNet {
             fx: fx, fy: fy, cx: cx, cy: cy
         )
 
-        // 3. Normalise 2D boxes.
+        // 3. Normalise 2D boxes. Model input is fixed shape [1, numBoxes, 4] —
+        //    pad unused slots with zeros; their outputs are discarded below.
         let W = Float(Self.imageSize)
         let H = Float(Self.imageSize)
-        var bb2dFlat: [Float] = []
-        for box in boxes2D {
-            bb2dFlat.append((box.xmin + 0.5) / W)
-            bb2dFlat.append((box.xmax + 0.5) / W)
-            bb2dFlat.append((box.ymin + 0.5) / H)
-            bb2dFlat.append((box.ymax + 0.5) / H)
+        let validM = min(boxes2D.count, Self.numBoxes)
+        var bb2dFlat = [Float](repeating: 0, count: Self.numBoxes * 4)
+        for idx in 0..<validM {
+            let box = boxes2D[idx]
+            bb2dFlat[idx * 4 + 0] = (box.xmin + 0.5) / W
+            bb2dFlat[idx * 4 + 1] = (box.xmax + 0.5) / W
+            bb2dFlat[idx * 4 + 2] = (box.ymin + 0.5) / H
+            bb2dFlat[idx * 4 + 3] = (box.ymax + 0.5) / H
         }
 
         // 4. Compute Plucker ray encoding.
         let rayEncoding = buildRayEncoding(T_vc: T_vc, fx: fx, fy: fy, cx: cx, cy: cy)
 
-        // 5. Run ONNX inference.
-        let M = boxes2D.count
+        // 5. Run ONNX inference — always at the model's fixed numBoxes.
         let (centers, sizes, yaws, confidences) = try runInference(
             image: image,
             sdpPatches: sdpPatches,
             bb2d: bb2dFlat,
             rayEncoding: rayEncoding,
-            numBoxes: M
+            numBoxes: Self.numBoxes
         )
 
-        // 6. Postprocess: voxel → world coords.
+        // 6. Postprocess only the valid boxes; discard padding outputs.
         var detections: [Detection3D] = []
-        for i in 0..<M {
+        for i in 0..<validM {
             let conf = confidences[i]
             guard conf >= confidenceThreshold else { continue }
 

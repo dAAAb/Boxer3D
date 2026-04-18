@@ -32,7 +32,11 @@ final class ARViewModel: ObservableObject {
 
     nonisolated private func loadModelsInBackground() async {
         let yoloPath = Bundle.main.path(forResource: "yolo11n", ofType: "onnx")
-        let boxerPath = Bundle.main.path(forResource: "BoxerNet", ofType: "onnx")
+        // Prefer fp16 static-shape (200 MB, ~2× faster on GPU/ANE). Fall back
+        // to fp32 static, then original dynamic model if static variants absent.
+        let boxerPath = Bundle.main.path(forResource: "BoxerNet_static_fp16", ofType: "onnx")
+            ?? Bundle.main.path(forResource: "BoxerNet_static", ofType: "onnx")
+            ?? Bundle.main.path(forResource: "BoxerNet", ofType: "onnx")
 
         await MainActor.run { self.status = "Loading YOLO..." }
         guard let yoloPath else {
@@ -98,9 +102,22 @@ final class ARViewModel: ObservableObject {
     nonisolated private func runPipeline(
         frame: ARFrame, boxer: BoxerNet, yolo: YOLODetector
     ) async throws -> [Detection3D] {
-        // 1. Convert camera image to CHW float arrays.
-        let (boxerImage, _, _) = pixelBufferToFloatArray(frame.capturedImage, targetSize: BoxerNet.imageSize)
-        let (yoloImage, _, _) = pixelBufferToFloatArray(frame.capturedImage, targetSize: 640)
+        // 1. Preprocess in parallel: two image resizes + depth extraction are
+        //    independent and CPU-bound on different data.
+        let capturedImage = frame.capturedImage
+        let sceneDepthMap = frame.sceneDepth!.depthMap
+        async let boxerImageT = Task.detached(priority: .userInitiated) {
+            pixelBufferToFloatArray(capturedImage, targetSize: BoxerNet.imageSize).0
+        }.value
+        async let yoloImageT = Task.detached(priority: .userInitiated) {
+            pixelBufferToFloatArray(capturedImage, targetSize: 640).0
+        }.value
+        async let depthMapT = Task.detached(priority: .userInitiated) {
+            extractDepthMap(sceneDepthMap)
+        }.value
+        let boxerImage = await boxerImageT
+        let yoloImage = await yoloImageT
+        let depthMap = await depthMapT
 
         // 2. YOLO 2D detection — keep top 3.
         let yoloBoxes = try yolo.detect(image: yoloImage, imageWidth: 640, imageHeight: 640)
@@ -108,7 +125,7 @@ final class ARViewModel: ObservableObject {
             await MainActor.run { self.status = "No objects detected" }
             return []
         }
-        let topBoxes = Array(yoloBoxes.sorted { $0.score > $1.score }.prefix(3))
+        let topBoxes = Array(yoloBoxes.sorted { $0.score > $1.score }.prefix(BoxerNet.numBoxes))
 
         // 3. Scale YOLO boxes (640 → 960) for BoxerNet.
         let scale = Float(BoxerNet.imageSize) / 640.0
@@ -118,8 +135,7 @@ final class ARViewModel: ObservableObject {
                   label: box.label, score: box.score)
         }
 
-        // 4. Extract LiDAR depth + scale intrinsics for center-cropped image.
-        let depthMap = extractDepthMap(frame.sceneDepth!.depthMap)
+        // 4. Scale intrinsics for center-cropped image.
         let intrinsics = scaleIntrinsicsWithCrop(
             frame.camera.intrinsics,
             from: frame.camera.imageResolution,
@@ -143,7 +159,9 @@ final class ARViewModel: ObservableObject {
     private func placeBoxes(_ detections: [Detection3D], in sceneView: ARSCNView) {
         clearBoxes()
 
-        let colors: [UIColor] = [.systemRed, .systemGreen, .systemBlue]
+        let colors: [UIColor] = [.systemRed, .systemGreen, .systemBlue, .systemOrange,
+                                 .systemPurple, .systemTeal, .systemYellow, .systemPink,
+                                 .systemIndigo, .systemBrown]
 
         for (i, det) in detections.enumerated() {
             let color = colors[i % colors.count]
