@@ -10,10 +10,10 @@ struct ARViewContainer: UIViewRepresentable {
         sceneView.autoenablesDefaultLighting = true
         sceneView.automaticallyUpdatesLighting = true
 
-        // Configure AR session with LiDAR.
+        // Configure AR session with LiDAR. Plane detection disabled — we don't
+        // use planes, and it eats noticeable memory / compute per frame.
         let config = ARWorldTrackingConfiguration()
         config.frameSemantics = [.sceneDepth]
-        config.planeDetection = [.horizontal, .vertical]
 
         sceneView.session.run(config)
         viewModel.setup(sceneView: sceneView)

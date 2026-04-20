@@ -56,7 +56,7 @@ struct Box2D {
 
 // MARK: - BoxerNet
 
-final class BoxerNet {
+final class BoxerNet: @unchecked Sendable {
     private let session: ORTSession
     private let env: ORTEnv
 
@@ -107,7 +107,7 @@ final class BoxerNet {
     ///   - boxes2D: Array of YOLO 2D detections in pixel coords (for the 960x960 image).
     ///   - confidenceThreshold: Minimum confidence to keep a detection.
     /// - Returns: Array of 3D detections in world coordinates.
-    func predict(
+    nonisolated func predict(
         image: [Float],            // CHW flat array, len = 3 * 960 * 960
         depthMap: [[Float]],       // HxW depth in metres (0 = invalid)
         intrinsics: simd_float3x3, // fx, fy, cx, cy from ARKit

@@ -14,8 +14,22 @@ struct ContentView: View {
         ZStack {
             ARViewContainer(viewModel: viewModel)
 
-            // Top spacer (removed status bar)
-            VStack { Spacer() }
+            // Top: "just added" toast
+            VStack {
+                if let last = viewModel.lastAdded {
+                    Text(last)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(.green.opacity(0.8))
+                        .cornerRadius(20)
+                        .padding(.top, 60)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+                Spacer()
+            }
+            .animation(.easeInOut(duration: 0.25), value: viewModel.lastAdded)
 
             // Detection cards at bottom left
             if !viewModel.detections.isEmpty {
@@ -72,25 +86,31 @@ struct ContentView: View {
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(.white.opacity(0.8))
                     .padding(.trailing, 12)
-                Button(action: { viewModel.detectNow() }) {
-                    ZStack {
-                        Circle()
-                            .fill(.white)
-                            .frame(width: 70, height: 70)
-                        Circle()
-                            .fill(viewModel.isProcessing ? .gray : .blue)
-                            .frame(width: 60, height: 60)
-                        if viewModel.isProcessing {
-                            ProgressView()
-                                .tint(.white)
-                        } else {
-                            Image(systemName: "cube.transparent.fill")
-                                .font(.system(size: 24))
-                                .foregroundColor(.white)
+                VStack(spacing: 10) {
+                    StreamToggleButton(streamMode: viewModel.streamMode,
+                                       action: { viewModel.toggleStream() })
+                    Button(action: { viewModel.detectNow() }) {
+                        ZStack {
+                            Circle()
+                                .fill(.white)
+                                .frame(width: 70, height: 70)
+                            Circle()
+                                .fill(viewModel.isProcessing ? .gray : .blue)
+                                .frame(width: 60, height: 60)
+                            if viewModel.isProcessing {
+                                ProgressView()
+                                    .tint(.white)
+                            } else {
+                                Image(systemName: "cube.transparent.fill")
+                                    .font(.system(size: 24))
+                                    .foregroundColor(.white)
+                            }
                         }
+                        .contentShape(Circle())
                     }
+                    .buttonStyle(.plain)
+                    .disabled(viewModel.isProcessing || viewModel.streamMode)
                 }
-                .disabled(viewModel.isProcessing)
                 .padding(.trailing, 20)
             }
         }
@@ -123,6 +143,27 @@ struct DetectionCard: View {
         .padding(.vertical, 6)
         .background(.black.opacity(0.6))
         .cornerRadius(6)
+    }
+}
+
+struct StreamToggleButton: View {
+    let streamMode: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Circle().fill(.white).frame(width: 54, height: 54)
+                Circle()
+                    .fill(streamMode ? Color.red : Color.black.opacity(0.7))
+                    .frame(width: 46, height: 46)
+                Image(systemName: streamMode ? "stop.fill" : "infinity")
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundColor(.white)
+            }
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
     }
 }
 

@@ -19,7 +19,7 @@ struct YOLOBox {
 }
 
 /// YOLO11n ONNX inference wrapper.
-final class YOLODetector {
+final class YOLODetector: @unchecked Sendable {
     private let session: ORTSession
     private let env: ORTEnv
 
@@ -62,7 +62,7 @@ final class YOLODetector {
     ///   - confThreshold: Minimum confidence.
     ///   - iouThreshold: NMS IoU threshold.
     /// - Returns: Array of 2D bounding boxes.
-    func detect(
+    nonisolated func detect(
         image: [Float],
         imageWidth: Int = 640,
         imageHeight: Int = 640,
