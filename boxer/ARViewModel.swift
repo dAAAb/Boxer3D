@@ -331,7 +331,7 @@ final class ARViewModel: ObservableObject {
             let node = SCNNode(geometry: box)
             node.simdWorldTransform = det.worldTransform
 
-            addWireframe(to: node, size: det.size, color: .white, radius: 0.003)
+            addWireframe(to: node, size: det.size, color: .white, radius: 0.005)
 
             let sizeStr = String(format: "%.0fx%.0fx%.0f cm",
                                  det.size.x * 100, det.size.y * 100, det.size.z * 100)
@@ -365,52 +365,102 @@ final class ARViewModel: ObservableObject {
         }
     }
 
+    /// Treat a new detection as a duplicate of an existing one when all three
+    /// conditions hold: (a) same label, (b) centre offset < 20% of the average
+    /// max-dimension, (c) volume ratio (smaller/larger) > 0.8.
+    /// Previously used only centre-distance, which let distinct objects of the
+    /// same class at similar spots get merged while also keeping re-detections
+    /// of the same object at slightly different positions.
     private func isDuplicate(label: String, center: simd_float3, size: simd_float3) -> Bool {
-        let newMax = max(size.x, max(size.y, size.z))
+        let newVol = size.x * size.y * size.z
+        let newMaxDim = max(size.x, max(size.y, size.z))
         for k in known where k.label == label {
-            let kMax = max(k.size.x, max(k.size.y, k.size.z))
-            let threshold = 0.5 * max(newMax, kMax)
-            if simd_distance(k.worldCenter, center) < threshold { return true }
+            let kMaxDim = max(k.size.x, max(k.size.y, k.size.z))
+            let avgMaxDim = (newMaxDim + kMaxDim) * 0.5
+            let dist = simd_distance(k.worldCenter, center)
+            guard dist < 0.20 * avgMaxDim else { continue }
+            let kVol = k.size.x * k.size.y * k.size.z
+            let volRatio = min(newVol, kVol) / max(newVol, kVol)
+            if volRatio > 0.80 { return true }
         }
         return false
     }
 
-    /// Add a wireframe of the box as a single SCNGeometry with 12 line-primitive
-    /// edges — 1 node + 1 draw call per box instead of 12 cylinder children.
-    /// `radius` is ignored (line primitive is 1 physical pixel; raise contrast via alpha if needed).
+    /// Build a thick wireframe by rendering each of the 12 edges as a 4-sided
+    /// triangular tube (radius = `radius` metres). All 12 tubes merge into a
+    /// single SCNGeometry so it stays 1 node + 1 draw call per box — same cost
+    /// as the line-primitive version but with configurable line thickness.
     private func addWireframe(to parent: SCNNode, size: simd_float3, color: UIColor, radius: Float) {
         let hw = size.x / 2, hh = size.y / 2, hd = size.z / 2
-        // 8 box corners, labeled by (x,y,z) sign: 0=bbb, 1=Bbb, 2=BbB, 3=bbB, 4=bBb, 5=BBb, 6=BBB, 7=bBB
-        let corners: [SCNVector3] = [
-            SCNVector3(-hw, -hh, -hd), SCNVector3( hw, -hh, -hd),
-            SCNVector3( hw, -hh,  hd), SCNVector3(-hw, -hh,  hd),
-            SCNVector3(-hw,  hh, -hd), SCNVector3( hw,  hh, -hd),
-            SCNVector3( hw,  hh,  hd), SCNVector3(-hw,  hh,  hd),
+        let corners: [simd_float3] = [
+            simd_float3(-hw, -hh, -hd), simd_float3( hw, -hh, -hd),
+            simd_float3( hw, -hh,  hd), simd_float3(-hw, -hh,  hd),
+            simd_float3(-hw,  hh, -hd), simd_float3( hw,  hh, -hd),
+            simd_float3( hw,  hh,  hd), simd_float3(-hw,  hh,  hd),
         ]
-        // 12 edges as index pairs into `corners`.
-        let edgeIdx: [Int32] = [
-            0,1, 1,2, 2,3, 3,0,   // bottom face
-            4,5, 5,6, 6,7, 7,4,   // top face
-            0,4, 1,5, 2,6, 3,7,   // vertical pillars
+        let edgeIdx: [(Int, Int)] = [
+            (0,1), (1,2), (2,3), (3,0),
+            (4,5), (5,6), (6,7), (7,4),
+            (0,4), (1,5), (2,6), (3,7),
         ]
 
-        let vertexSource = SCNGeometrySource(vertices: corners)
-        let indexData = Data(bytes: edgeIdx, count: edgeIdx.count * MemoryLayout<Int32>.stride)
+        var verts: [SCNVector3] = []
+        var normals: [SCNVector3] = []
+        var indices: [Int32] = []
+        verts.reserveCapacity(12 * 8)
+        normals.reserveCapacity(12 * 8)
+        indices.reserveCapacity(12 * 24)
+
+        for (a, b) in edgeIdx {
+            let p0 = corners[a], p1 = corners[b]
+            let dir = simd_normalize(p1 - p0)
+            // Pick a stable reference axis non-parallel to dir.
+            let refUp = abs(dir.y) < 0.99 ? simd_float3(0, 1, 0) : simd_float3(1, 0, 0)
+            let right = simd_normalize(simd_cross(dir, refUp)) * radius
+            let up = simd_normalize(simd_cross(right, dir)) * radius
+
+            let offsets: [simd_float3] = [right, up, -right, -up]
+            let base = Int32(verts.count)
+
+            for off in offsets {
+                let world = p0 + off
+                verts.append(SCNVector3(world.x, world.y, world.z))
+                let n = simd_normalize(off)
+                normals.append(SCNVector3(n.x, n.y, n.z))
+            }
+            for off in offsets {
+                let world = p1 + off
+                verts.append(SCNVector3(world.x, world.y, world.z))
+                let n = simd_normalize(off)
+                normals.append(SCNVector3(n.x, n.y, n.z))
+            }
+            // 4 side quads (each = 2 triangles) around the tube.
+            for i in 0..<4 {
+                let next = (i + 1) % 4
+                let v0 = base + Int32(i)
+                let v1 = base + Int32(next)
+                let v2 = base + 4 + Int32(next)
+                let v3 = base + 4 + Int32(i)
+                indices.append(contentsOf: [v0, v1, v2, v0, v2, v3])
+            }
+        }
+
+        let vertexSource = SCNGeometrySource(vertices: verts)
+        let normalSource = SCNGeometrySource(normals: normals)
+        let indexData = Data(bytes: indices, count: indices.count * MemoryLayout<Int32>.stride)
         let element = SCNGeometryElement(
             data: indexData,
-            primitiveType: .line,
-            primitiveCount: 12,
+            primitiveType: .triangles,
+            primitiveCount: indices.count / 3,
             bytesPerIndex: MemoryLayout<Int32>.size
         )
 
         let material = SCNMaterial()
         material.diffuse.contents = color
         material.lightingModel = .constant
-        material.isDoubleSided = true
 
-        let geometry = SCNGeometry(sources: [vertexSource], elements: [element])
+        let geometry = SCNGeometry(sources: [vertexSource, normalSource], elements: [element])
         geometry.materials = [material]
-
         parent.addChildNode(SCNNode(geometry: geometry))
     }
 
