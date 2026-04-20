@@ -1,0 +1,5 @@
+torch==2.4.0
+numpy<2
+coremltools>=8.1
+einops
+huggingface_hub
