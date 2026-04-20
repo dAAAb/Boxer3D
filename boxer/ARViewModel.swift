@@ -41,8 +41,10 @@ final class ARViewModel: ObservableObject {
     /// the in-flight Task's completion is discarded instead of updating the scene.
     private var cycleToken: Int = 0
 
-    /// Hard cap on accumulated detections to avoid jetsam OOM on long streams.
-    private static let maxKnown = 15
+    /// Hard cap on accumulated detections. With native CoreML (single 192 MB
+    /// mlpackage, no ORT doubling) + line-primitive wireframes (2 nodes/box
+    /// instead of 14), memory and rendering head-room are both much larger.
+    private static let maxKnown = 50
     /// Minimum camera translation (m) since last detection before triggering next cycle.
     private static let motionTranslationThreshold: Float = 0.20   // 20 cm
     /// Minimum camera rotation (rad) since last detection before triggering next cycle.
@@ -373,39 +375,43 @@ final class ARViewModel: ObservableObject {
         return false
     }
 
+    /// Add a wireframe of the box as a single SCNGeometry with 12 line-primitive
+    /// edges — 1 node + 1 draw call per box instead of 12 cylinder children.
+    /// `radius` is ignored (line primitive is 1 physical pixel; raise contrast via alpha if needed).
     private func addWireframe(to parent: SCNNode, size: simd_float3, color: UIColor, radius: Float) {
         let hw = size.x / 2, hh = size.y / 2, hd = size.z / 2
-        let edgeMat = SCNMaterial()
-        edgeMat.diffuse.contents = color
-
-        let edges: [(simd_float3, simd_float3)] = [
-            (simd_float3(-hw, -hh, -hd), simd_float3( hw, -hh, -hd)),
-            (simd_float3( hw, -hh, -hd), simd_float3( hw, -hh,  hd)),
-            (simd_float3( hw, -hh,  hd), simd_float3(-hw, -hh,  hd)),
-            (simd_float3(-hw, -hh,  hd), simd_float3(-hw, -hh, -hd)),
-            (simd_float3(-hw,  hh, -hd), simd_float3( hw,  hh, -hd)),
-            (simd_float3( hw,  hh, -hd), simd_float3( hw,  hh,  hd)),
-            (simd_float3( hw,  hh,  hd), simd_float3(-hw,  hh,  hd)),
-            (simd_float3(-hw,  hh,  hd), simd_float3(-hw,  hh, -hd)),
-            (simd_float3(-hw, -hh, -hd), simd_float3(-hw,  hh, -hd)),
-            (simd_float3( hw, -hh, -hd), simd_float3( hw,  hh, -hd)),
-            (simd_float3( hw, -hh,  hd), simd_float3( hw,  hh,  hd)),
-            (simd_float3(-hw, -hh,  hd), simd_float3(-hw,  hh,  hd)),
+        // 8 box corners, labeled by (x,y,z) sign: 0=bbb, 1=Bbb, 2=BbB, 3=bbB, 4=bBb, 5=BBb, 6=BBB, 7=bBB
+        let corners: [SCNVector3] = [
+            SCNVector3(-hw, -hh, -hd), SCNVector3( hw, -hh, -hd),
+            SCNVector3( hw, -hh,  hd), SCNVector3(-hw, -hh,  hd),
+            SCNVector3(-hw,  hh, -hd), SCNVector3( hw,  hh, -hd),
+            SCNVector3( hw,  hh,  hd), SCNVector3(-hw,  hh,  hd),
+        ]
+        // 12 edges as index pairs into `corners`.
+        let edgeIdx: [Int32] = [
+            0,1, 1,2, 2,3, 3,0,   // bottom face
+            4,5, 5,6, 6,7, 7,4,   // top face
+            0,4, 1,5, 2,6, 3,7,   // vertical pillars
         ]
 
-        for (a, b) in edges {
-            let cyl = SCNCylinder(radius: CGFloat(radius), height: CGFloat(simd_distance(a, b)))
-            cyl.materials = [edgeMat]
-            let node = SCNNode(geometry: cyl)
-            node.simdPosition = (a + b) / 2
-            let dir = simd_normalize(b - a)
-            let dot = simd_dot(simd_float3(0, 1, 0), dir)
-            if abs(dot) < 0.999 {
-                let axis = simd_normalize(simd_cross(simd_float3(0, 1, 0), dir))
-                node.simdRotation = simd_float4(axis, acos(dot))
-            }
-            parent.addChildNode(node)
-        }
+        let vertexSource = SCNGeometrySource(vertices: corners)
+        let indexData = Data(bytes: edgeIdx, count: edgeIdx.count * MemoryLayout<Int32>.stride)
+        let element = SCNGeometryElement(
+            data: indexData,
+            primitiveType: .line,
+            primitiveCount: 12,
+            bytesPerIndex: MemoryLayout<Int32>.size
+        )
+
+        let material = SCNMaterial()
+        material.diffuse.contents = color
+        material.lightingModel = .constant
+        material.isDoubleSided = true
+
+        let geometry = SCNGeometry(sources: [vertexSource], elements: [element])
+        geometry.materials = [material]
+
+        parent.addChildNode(SCNNode(geometry: geometry))
     }
 
     private func addLabel(_ text: String, to parent: SCNNode, offset: Float) {
