@@ -17,14 +17,7 @@
 import Foundation
 import Accelerate
 import simd
-import OnnxRuntimeBindings
-
-private func optimizedModelPath(for name: String) -> String {
-    let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("ort-optimized")
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir.appendingPathComponent("\(name).ort").path
-}
+import CoreML
 
 // MARK: - Data Types
 
@@ -57,8 +50,7 @@ struct Box2D {
 // MARK: - BoxerNet
 
 final class BoxerNet: @unchecked Sendable {
-    private let session: ORTSession
-    private let env: ORTEnv
+    private let model: MLModel
 
     /// Image size the model expects (960x960).
     static let imageSize: Int = 960
@@ -70,29 +62,26 @@ final class BoxerNet: @unchecked Sendable {
     static let numPatches: Int = gridH * gridW     // 3600
 
     /// Fixed number of boxes this (static-shape) model expects per call.
-    /// Must match `num_boxes` used when exporting BoxerNet_static.onnx.
+    /// Must match `num_boxes` baked into the converted .mlpackage.
     /// Unused slots get padded with zero boxes and their outputs are discarded.
-    /// CoreML requires static shapes to keep the graph from fragmenting into
-    /// hundreds of partitions, so some upper bound is mandatory.
     static let numBoxes: Int = 3
 
-    init(modelPath: String) throws {
-        env = try ORTEnv(loggingLevel: .warning)
-        let opts = try ORTSessionOptions()
-        try opts.setGraphOptimizationLevel(.all)
-        try opts.setOptimizedModelFilePath(optimizedModelPath(for: "BoxerNet"))
-        // Model is static-shape (num_boxes fixed at BoxerNet.numBoxes); RequireStaticInputShapes
-        // lets CoreML take the whole graph as one partition instead of ~150
-        // fragments. CPUAndGPU skips ANE conversion that OOMs on 400 MB model.
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("coreml-boxer").path
-        try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
-        try opts.appendCoreMLExecutionProvider(withOptionsV2: [
-            "MLComputeUnits": "CPUAndGPU",
-            "RequireStaticInputShapes": "1",
-            "ModelCacheDirectory": cacheDir,
-        ])
-        session = try ORTSession(env: env, modelPath: modelPath, sessionOptions: opts)
+    /// Loads the .mlmodelc Xcode produced from the dragged-in BoxerNet.mlpackage.
+    /// Falls back to on-device compilation of .mlpackage if only that is present.
+    init() throws {
+        let config = MLModelConfiguration()
+        config.computeUnits = .all   // 815/815 ops land on ANE for this model.
+
+        let url: URL
+        if let compiled = Bundle.main.url(forResource: "BoxerNetModel", withExtension: "mlmodelc") {
+            url = compiled
+        } else if let pkg = Bundle.main.url(forResource: "BoxerNetModel", withExtension: "mlpackage") {
+            url = try MLModel.compileModel(at: pkg)
+        } else {
+            throw NSError(domain: "BoxerNet", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "BoxerNetModel.mlpackage not in bundle — drag it into the Xcode project."])
+        }
+        model = try MLModel(contentsOf: url, configuration: config)
     }
 
     // MARK: - Public API
@@ -221,59 +210,56 @@ final class BoxerNet: @unchecked Sendable {
         let gW = Self.gridW
         let N = Self.numPatches
 
-        // Create input tensors.
-        let imageData = Data(bytes: image, count: image.count * MemoryLayout<Float>.stride)
-        let imageTensor = try ORTValue(
-            tensorData: NSMutableData(data: imageData),
-            elementType: .float,
-            shape: [1, 3, NSNumber(value: S), NSNumber(value: S)]
-        )
+        let imageArr = try mlArrayFromFloat(image, shape: [1, 3, S, S])
+        let sdpArr = try mlArrayFromFloat(sdpPatches, shape: [1, 1, gH, gW])
+        let bb2dArr = try mlArrayFromFloat(bb2d, shape: [1, numBoxes, 4])
+        let rayArr = try mlArrayFromFloat(rayEncoding, shape: [1, N, 6])
 
-        let sdpData = Data(bytes: sdpPatches, count: sdpPatches.count * MemoryLayout<Float>.stride)
-        let sdpTensor = try ORTValue(
-            tensorData: NSMutableData(data: sdpData),
-            elementType: .float,
-            shape: [1, 1, NSNumber(value: gH), NSNumber(value: gW)]
-        )
+        let features = try MLDictionaryFeatureProvider(dictionary: [
+            "image": imageArr,
+            "sdp_median": sdpArr,
+            "bb2d_norm": bb2dArr,
+            "ray_enc": rayArr,
+        ])
+        let out = try model.prediction(from: features)
 
-        let bb2dData = Data(bytes: bb2d, count: bb2d.count * MemoryLayout<Float>.stride)
-        let bb2dTensor = try ORTValue(
-            tensorData: NSMutableData(data: bb2dData),
-            elementType: .float,
-            shape: [1, NSNumber(value: numBoxes), 4]
-        )
+        // params: (1, M, 7) = [cx, cy, cz, w, h, d, yaw] in voxel frame, fp16.
+        // prob:   (1, M)    fp16.
+        guard let params = out.featureValue(for: "params")?.multiArrayValue,
+              let prob = out.featureValue(for: "prob")?.multiArrayValue
+        else {
+            throw NSError(domain: "BoxerNet", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "Missing params/prob outputs"])
+        }
 
-        let rayData = Data(bytes: rayEncoding, count: rayEncoding.count * MemoryLayout<Float>.stride)
-        let rayTensor = try ORTValue(
-            tensorData: NSMutableData(data: rayData),
-            elementType: .float,
-            shape: [1, NSNumber(value: N), 6]
-        )
+        // Split params into center/size/yaw. head.py stores [center_xyz, size_whd, yaw]
+        // where size_whd is actually [h, w, d] per AleHead.forward — match the ONNX
+        // output convention this codebase already consumes.
+        var centers = [Float](repeating: 0, count: numBoxes * 3)
+        var sizes = [Float](repeating: 0, count: numBoxes * 3)
+        var yaws = [Float](repeating: 0, count: numBoxes)
+        for i in 0..<numBoxes {
+            for k in 0..<3 {
+                centers[i * 3 + k] = params[[0, i, k] as [NSNumber]].floatValue
+                sizes[i * 3 + k] = params[[0, i, 3 + k] as [NSNumber]].floatValue
+            }
+            yaws[i] = params[[0, i, 6] as [NSNumber]].floatValue
+        }
+        var confs = [Float](repeating: 0, count: numBoxes)
+        for i in 0..<numBoxes {
+            confs[i] = prob[[0, i] as [NSNumber]].floatValue
+        }
+        return (centers, sizes, yaws, confs)
+    }
 
-        // Run.
-        let outputs = try session.run(
-            withInputs: [
-                "image": imageTensor,
-                "sdp_patches": sdpTensor,
-                "bb2d": bb2dTensor,
-                "ray_encoding": rayTensor,
-            ],
-            outputNames: ["center", "size", "yaw", "confidence"],
-            runOptions: nil
-        )
-
-        // Extract outputs.
-        let centersData = try outputs["center"]!.tensorData() as Data
-        let sizesData = try outputs["size"]!.tensorData() as Data
-        let yawsData = try outputs["yaw"]!.tensorData() as Data
-        let confsData = try outputs["confidence"]!.tensorData() as Data
-
-        let centers = centersData.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-        let sizes = sizesData.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-        let yaws = yawsData.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-        let confidences = confsData.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-
-        return (centers, sizes, yaws, confidences)
+    /// Allocate an MLMultiArray and copy a contiguous Float32 payload in via pointer.
+    private func mlArrayFromFloat(_ src: [Float], shape: [Int]) throws -> MLMultiArray {
+        let arr = try MLMultiArray(shape: shape.map { NSNumber(value: $0) }, dataType: .float32)
+        let ptr = arr.dataPointer.assumingMemoryBound(to: Float.self)
+        src.withUnsafeBufferPointer { buf in
+            ptr.update(from: buf.baseAddress!, count: src.count)
+        }
+        return arr
     }
 
     // MARK: - Preprocessing: SDP Patches

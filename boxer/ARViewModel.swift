@@ -74,11 +74,6 @@ final class ARViewModel: ObservableObject {
 
     nonisolated private func loadModelsInBackground() async {
         let yoloPath = Bundle.main.path(forResource: "yolo11n", ofType: "onnx")
-        // Prefer fp16 static-shape (200 MB, ~2× faster on GPU/ANE). Fall back
-        // to fp32 static, then original dynamic model if static variants absent.
-        let boxerPath = Bundle.main.path(forResource: "BoxerNet_static_fp16", ofType: "onnx")
-            ?? Bundle.main.path(forResource: "BoxerNet_static", ofType: "onnx")
-            ?? Bundle.main.path(forResource: "BoxerNet", ofType: "onnx")
 
         await MainActor.run { self.status = "Loading YOLO..." }
         guard let yoloPath else {
@@ -92,13 +87,9 @@ final class ARViewModel: ObservableObject {
             return
         }
 
-        await MainActor.run { self.status = "Loading BoxerNet..." }
-        guard let boxerPath else {
-            await MainActor.run { self.status = "BoxerNet.onnx not found" }
-            return
-        }
+        await MainActor.run { self.status = "Loading BoxerNet (CoreML)…" }
         let boxer: BoxerNet
-        do { boxer = try BoxerNet(modelPath: boxerPath) }
+        do { boxer = try BoxerNet() }
         catch {
             await MainActor.run { self.status = "BoxerNet failed: \(error.localizedDescription)" }
             return

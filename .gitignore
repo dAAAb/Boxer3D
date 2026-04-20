@@ -15,6 +15,8 @@ DerivedData/
 
 # ONNX models (too large for git — use Git LFS or download script)
 *.onnx
+# CoreML packages (generated via convert/)
+*.mlpackage
 *.pyc
 
 # HuggingFace download artifacts in boxer/
