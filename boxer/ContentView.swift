@@ -10,9 +10,9 @@ import Combine
 
 struct ContentView: View {
     @StateObject private var viewModel = ARViewModel()
-    /// Ticks ~20 Hz while a detection is selected, so the off-screen arrow keeps
-    /// pointing toward the target as the camera moves.
-    private let arrowTick = Timer.publish(every: 0.05, on: .main, in: .common).autoconnect()
+    /// 33 Hz tick — drives the MOT spring tween for every live track, and
+    /// (when a detection is selected) also updates the off-screen arrow.
+    private let uiTick = Timer.publish(every: 1.0 / 33.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
         ZStack {
@@ -116,18 +116,20 @@ struct ContentView: View {
                             Circle()
                                 .fill(.white)
                                 .frame(width: 70, height: 70)
+                            // In stream mode: stay solid blue (no per-cycle gray flash)
+                            // so the button doesn't look like it's auto-firing.
                             Circle()
-                                .fill(viewModel.isProcessing ? .gray : .blue)
+                                .fill(detectButtonFill(viewModel))
                                 .frame(width: 60, height: 60)
-                            if viewModel.isProcessing {
-                                ProgressView()
-                                    .tint(.white)
+                            if viewModel.isProcessing && !viewModel.streamMode {
+                                ProgressView().tint(.white)
                             } else {
                                 Image(systemName: "cube.transparent.fill")
                                     .font(.system(size: 24))
                                     .foregroundColor(.white)
                             }
                         }
+                        .opacity(viewModel.streamMode ? 0.35 : 1.0)
                         .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
@@ -136,7 +138,8 @@ struct ContentView: View {
                 .padding(.trailing, 20)
             }
         }
-        .onReceive(arrowTick) { _ in
+        .onReceive(uiTick) { _ in
+            viewModel.tickTracks()
             if viewModel.selectedId != nil {
                 viewModel.updateOffscreenHint()
             }
@@ -211,6 +214,14 @@ struct StreamToggleButton: View {
         }
         .buttonStyle(.plain)
     }
+}
+
+/// Solid blue while streaming (button is disabled anyway and shouldn't flash),
+/// gray while a single-shot is running, blue when idle.
+@MainActor
+private func detectButtonFill(_ vm: ARViewModel) -> Color {
+    if vm.streamMode { return .blue }
+    return vm.isProcessing ? .gray : .blue
 }
 
 // Must match colors in ARViewModel.placeBoxes

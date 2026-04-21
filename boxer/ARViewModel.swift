@@ -16,10 +16,24 @@ private struct KnownDetection {
     let id: UUID
     let label: String
     let instanceIndex: Int
-    let worldCenter: simd_float3
+    /// Rendered position — driven by the spring tween toward `targetTransform`.
+    var worldCenter: simd_float3
+    /// Frozen on creation; we don't regenerate geometry per cycle.
     let size: simd_float3
     let node: SCNNode
     let wireframeNode: SCNNode
+    /// Latest observed transform (match target for the tween).
+    var targetTransform: simd_float4x4
+    /// Spring-damped velocity per axis (m/s).
+    var velocity: simd_float3 = .zero
+    /// CACurrentMediaTime() of last match — used for age-out.
+    var lastSeen: CFTimeInterval
+    /// Number of detection matches so far. Hysteresis: confirmed tracks
+    /// (hits ≥ 2) survive long silent gaps; provisional (hits == 1) tracks
+    /// expire fast to kill single-frame spurious detections.
+    var hits: Int = 1
+    /// True once a fade-out action is scheduled, to prevent re-triggering.
+    var reaping: Bool = false
 }
 
 /// Screen-space guidance for an off-screen selected object.
@@ -53,6 +67,10 @@ final class ARViewModel: ObservableObject {
     /// Running count of detections per class, used to number instances
     /// ("bottle #3"). Reset on clearBoxes.
     private var instanceCountByLabel: [String: Int] = [:]
+    /// Timestamp of the previous `tickTracks()` call; used to compute dt for
+    /// the spring integrator. Reset on clearBoxes so the first tick after a
+    /// reset is a no-op.
+    private var lastTickTime: CFTimeInterval? = nil
     private var memoryWarningObserver: NSObjectProtocol?
     private var lastDetectionCameraTransform: simd_float4x4?
     private var motionCheckTask: Task<Void, Never>?
@@ -68,8 +86,10 @@ final class ARViewModel: ObservableObject {
     private static let motionTranslationThreshold: Float = 0.20   // 20 cm
     /// Minimum camera rotation (rad) since last detection before triggering next cycle.
     private static let motionRotationThreshold: Float = 0.35      // ~20°
-    /// Minimum delay between cycles (ms) — lets ORT/CoreML release buffers.
-    private static let cycleCooldownMs: Int = 600
+    /// Minimum delay between cycles (ms). With native CoreML the old ORT
+    /// buffer-release reason no longer applies; tiny cooldown lets the ARKit
+    /// frame update between cycles without hammering ANE back-to-back.
+    private static let cycleCooldownMs: Int = 30
 
     func setup(sceneView: ARSCNView) {
         self.sceneView = sceneView
@@ -172,32 +192,20 @@ final class ARViewModel: ObservableObject {
         isProcessing = false
     }
 
-    /// Poll camera motion until it exceeds threshold, then kick off next cycle.
-    /// Enforces a minimum cooldown so ORT/CoreML can release buffers between cycles.
+    /// Schedule the next cycle. Tesla-style: perception always-on while the
+    /// stream is active. The old motion-gate "idle" behaviour is gone — MOT
+    /// needs continuous updates so objects moving in view keep their tracks
+    /// refreshed even when the camera is still. Only the inter-cycle cooldown
+    /// remains, to avoid back-to-back ANE submissions.
     private func scheduleNextWhenMoving() {
         motionCheckTask?.cancel()
         let cooldown = UInt64(Self.cycleCooldownMs) * 1_000_000
         motionCheckTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: cooldown)
-            while !Task.isCancelled {
-                guard let self else { return }
-                let go = await MainActor.run { () -> Bool in
-                    guard self.streamMode else { return false }
-                    return self.hasMovedEnough()
-                }
-                if go {
-                    await MainActor.run {
-                        guard self.streamMode, !self.isProcessing else { return }
-                        self.detectNow()
-                    }
-                    return
-                }
-                await MainActor.run {
-                    if self.streamMode {
-                        self.status = "Streaming · \(self.known.count) known · idle"
-                    }
-                }
-                try? await Task.sleep(nanoseconds: 250_000_000) // 250 ms poll
+            guard let self else { return }
+            await MainActor.run {
+                guard self.streamMode, !self.isProcessing else { return }
+                self.detectNow()
             }
         }
     }
@@ -319,6 +327,66 @@ final class ARViewModel: ObservableObject {
         )
     }
 
+    /// Per-frame update driven by ContentView's 33 Hz timer.
+    /// Runs the critical-damped spring on each live track, then ages out
+    /// tracks not matched in the last 5 seconds.
+    func tickTracks() {
+        let now = CACurrentMediaTime()
+        let dtRaw = lastTickTime.map { now - $0 } ?? 0
+        let dt = Float(min(dtRaw, 1.0 / 20.0))   // cap at 50 ms for stability
+        lastTickTime = now
+
+        if dt > 0 && !known.isEmpty {
+            let omega: Float = 14.0   // rad/s → ~200 ms settle for a 10 cm step
+            for i in known.indices where !known[i].reaping {
+                let goal = simd_make_float3(known[i].targetTransform.columns.3)
+                let delta = goal - known[i].worldCenter
+                // Critical-damped spring, semi-implicit Euler.
+                let accel = -2 * omega * known[i].velocity + omega * omega * delta
+                known[i].velocity += accel * dt
+                known[i].worldCenter += known[i].velocity * dt
+                // Snap when we're within 0.5 mm + essentially stopped.
+                if simd_length(delta) < 5e-4 && simd_length(known[i].velocity) < 5e-4 {
+                    known[i].worldCenter = goal
+                    known[i].velocity = .zero
+                }
+                // Compose rendered transform: rotation from target, translation tweened.
+                var m = known[i].targetTransform
+                m.columns.3 = simd_float4(known[i].worldCenter, 1)
+                known[i].node.simdWorldTransform = m
+            }
+        }
+        reapStaleTracks(now: now)
+    }
+
+    private func reapStaleTracks(now: CFTimeInterval) {
+        for i in known.indices where !known[i].reaping {
+            // Tesla-style hysteresis: confirmed tracks (seen ≥ 2 cycles) coast
+            // for a long time; provisional tracks still get 8 s so a brief
+            // phone shake / motion-blur doesn't pop a newly-seen box. Only
+            // truly ghost single-frame detections age out.
+            let timeout: CFTimeInterval = known[i].hits >= 2 ? 20.0 : 8.0
+            if now - known[i].lastSeen > timeout {
+                known[i].reaping = true
+                let id = known[i].id
+                let node = known[i].node
+                node.runAction(SCNAction.fadeOut(duration: 0.3)) { [weak self] in
+                    Task { @MainActor in self?.finalReap(id: id, node: node) }
+                }
+            }
+        }
+    }
+
+    private func finalReap(id: UUID, node: SCNNode) {
+        node.removeFromParentNode()
+        known.removeAll { $0.id == id }
+        detections.removeAll { $0.id == id }
+        if selectedId == id {
+            selectedId = nil
+            offscreenHint = nil
+        }
+    }
+
     func toggleStream() {
         streamMode.toggle()
         if streamMode {
@@ -431,19 +499,41 @@ final class ARViewModel: ObservableObject {
     // MARK: - 3D Box Rendering
 
     private func placeBoxes(_ detections: [Detection3D], in sceneView: ARSCNView) {
+        let now = CACurrentMediaTime()
+
+        // 1. Score all (detection, existing-track) pairs, greedy-match by ascending score.
+        struct Pair { let d: Int; let t: Int; let score: Float }
+        var pairs: [Pair] = []
+        for (d, det) in detections.enumerated() {
+            let newCenter = simd_make_float3(det.worldTransform.columns.3)
+            let label = det.label ?? "object"
+            for (t, k) in known.enumerated() where !k.reaping {
+                if let s = matchScore(label: label, center: newCenter, size: det.size,
+                                      against: k) {
+                    pairs.append(Pair(d: d, t: t, score: s))
+                }
+            }
+        }
+        pairs.sort { $0.score < $1.score }
+
+        var claimedDet = Set<Int>(); var claimedTrack = Set<Int>()
+        for p in pairs where p.score <= 1.5 {
+            if claimedDet.contains(p.d) || claimedTrack.contains(p.t) { continue }
+            updateTrack(at: p.t, with: detections[p.d], now: now)
+            claimedDet.insert(p.d); claimedTrack.insert(p.t)
+        }
+
+        // 2. Unclaimed detections → new tracks (existing creation path).
         var addedTags: [String] = []
-        for det in detections {
+        for (d, det) in detections.enumerated() where !claimedDet.contains(d) {
             let label = det.label ?? "object"
             let center = simd_make_float3(det.worldTransform.columns.3)
-            if isDuplicate(label: label, center: center, size: det.size) { continue }
 
-            // Next sequential index for this class: "bottle #1", "bottle #2", …
             let nextIdx = (instanceCountByLabel[label] ?? 0) + 1
             instanceCountByLabel[label] = nextIdx
             let tag = "\(label) #\(nextIdx)"
             addedTags.append(tag)
 
-            // Semi-transparent white fill — Tesla-style proxy.
             let box = SCNBox(width: CGFloat(det.size.x), height: CGFloat(det.size.y),
                              length: CGFloat(det.size.z), chamferRadius: 0)
             let mat = SCNMaterial()
@@ -461,9 +551,13 @@ final class ARViewModel: ObservableObject {
 
             let info = DetectionInfo(label: label, instanceIndex: nextIdx,
                                      size: det.size, confidence: det.confidence)
-            known.append(KnownDetection(id: info.id, label: label, instanceIndex: nextIdx,
-                                        worldCenter: center, size: det.size,
-                                        node: node, wireframeNode: wireframeNode))
+            known.append(KnownDetection(
+                id: info.id, label: label, instanceIndex: nextIdx,
+                worldCenter: center, size: det.size,
+                node: node, wireframeNode: wireframeNode,
+                targetTransform: det.worldTransform,
+                velocity: .zero, lastSeen: now, reaping: false
+            ))
             self.detections.append(info)
 
             if known.count >= Self.maxKnown {
@@ -477,6 +571,45 @@ final class ARViewModel: ObservableObject {
         }
     }
 
+    /// Score a candidate (new-detection, existing-track) pair. Returns nil if
+    /// the pair isn't a plausible match at all; lower score means better.
+    /// See plan: same-label gate = max(0.25 m, 0.75 × maxDim), volRatio ≥ 0.35.
+    /// Cross-label soft-merge: dist < 0.5 × maxDim AND volRatio ≥ 0.5.
+    private func matchScore(label: String, center: simd_float3, size: simd_float3,
+                            against k: KnownDetection) -> Float? {
+        let newMaxDim = max(size.x, max(size.y, size.z))
+        let kMaxDim = max(k.size.x, max(k.size.y, k.size.z))
+        let dist = simd_distance(k.worldCenter, center)
+        let newVol = size.x * size.y * size.z
+        let kVol = k.size.x * k.size.y * k.size.z
+        let volRatio = min(newVol, kVol) / max(newVol, kVol)
+        let gate = max(Float(0.25), 0.75 * max(newMaxDim, kMaxDim))
+
+        if k.label == label {
+            guard dist < gate, volRatio >= 0.35 else { return nil }
+            return dist / gate + 0.5 * (1 - volRatio)
+        } else {
+            // Soft cross-class merge — catches cup/bottle YOLO flips.
+            guard dist < 0.5 * max(newMaxDim, kMaxDim), volRatio >= 0.5 else { return nil }
+            return dist / gate + 0.5 * (1 - volRatio) + 0.3  // small cross-class penalty
+        }
+    }
+
+    /// Update an existing track with a new observation. Size is frozen on
+    /// creation; we only push the target transform and refresh lastSeen. The
+    /// DetectionInfo row stays the same (same UUID → selection sticks).
+    private func updateTrack(at idx: Int, with det: Detection3D, now: CFTimeInterval) {
+        known[idx].targetTransform = det.worldTransform
+        known[idx].lastSeen = now
+        known[idx].hits += 1
+        // If the track was fading out, cancel that — it's been seen again.
+        if known[idx].reaping {
+            known[idx].node.removeAllActions()
+            known[idx].node.opacity = 1.0
+            known[idx].reaping = false
+        }
+    }
+
     private func flashAdded(_ text: String) {
         lastAdded = "+ \(text)"
         lastAddedClearTask?.cancel()
@@ -487,38 +620,6 @@ final class ARViewModel: ObservableObject {
         }
     }
 
-    /// Dedup: two passes.
-    /// 1. **Same label** — loose thresholds, tolerates position drift from the
-    ///    480-input noise. Two same-class objects need to be >1 full extent
-    ///    apart to count as distinct.
-    /// 2. **Cross label** — tight overlap + similar volume. Catches YOLO class
-    ///    flip-flops (cup ↔ bottle ↔ wine glass, which COCO classes routinely
-    ///    confuse) on the same physical object.
-    private func isDuplicate(label: String, center: simd_float3, size: simd_float3) -> Bool {
-        let newVol = size.x * size.y * size.z
-        let newMaxDim = max(size.x, max(size.y, size.z))
-        for k in known {
-            let kMaxDim = max(k.size.x, max(k.size.y, k.size.z))
-            let dist = simd_distance(k.worldCenter, center)
-            let kVol = k.size.x * k.size.y * k.size.z
-            let volRatio = min(newVol, kVol) / max(newVol, kVol)
-
-            if k.label == label {
-                // Same label: overlap if centre distance < sum of half-max-dims.
-                if dist < (newMaxDim + kMaxDim) * 0.5 && volRatio > 0.20 {
-                    return true
-                }
-            } else {
-                // Different label: stricter — centres must be well inside each
-                // other's extent (avg half-max) and volumes within 2×.
-                let avgHalf = (newMaxDim + kMaxDim) * 0.25
-                if dist < avgHalf && volRatio > 0.5 {
-                    return true
-                }
-            }
-        }
-        return false
-    }
 
     /// Build a thick wireframe by rendering each of the 12 edges as a 4-sided
     /// triangular tube (radius = `radius` metres). All 12 tubes merge into a
@@ -603,16 +704,24 @@ final class ARViewModel: ObservableObject {
     }
 
     private func addLabel(_ text: String, to parent: SCNNode, offset: Float) {
-        let scnText = SCNText(string: text, extrusionDepth: 0.003)
-        scnText.font = UIFont.systemFont(ofSize: 0.022, weight: .semibold)
-        scnText.firstMaterial?.diffuse.contents = UIColor.white
-        scnText.firstMaterial?.lightingModel = .constant   // no shading, crisper
+        // SCNText.font sizes in typographic points — NOT world metres.
+        // Build at a normal font size, then scale the node down to the
+        // desired world-space height.
+        let scnText = SCNText(string: text, extrusionDepth: 0.0)
+        scnText.font = UIFont.monospacedSystemFont(ofSize: 48, weight: .medium)
         scnText.flatness = 0.1
+        scnText.firstMaterial?.diffuse.contents = UIColor.white
+        scnText.firstMaterial?.lightingModel = .constant  // no shading; crisp edges
+
+        let (bMin, bMax) = scnText.boundingBox
+        let localW = Float(bMax.x - bMin.x)
+        let localH = Float(bMax.y - bMin.y)
+        let desiredWorldHeight: Float = 0.006   // 6 mm — subtle HUD-style tag
+        let scale = desiredWorldHeight / max(localH, 1)
+
         let node = SCNNode(geometry: scnText)
-        // Centre the text roughly above the box (SCNText origin is bottom-left).
-        let bbox = scnText.boundingBox
-        let textWidth = Float(bbox.max.x - bbox.min.x)
-        node.position = SCNVector3(-textWidth / 2, offset, 0)
+        node.scale = SCNVector3(scale, scale, scale)
+        node.position = SCNVector3(-localW * scale / 2, offset, 0)
         node.constraints = [SCNBillboardConstraint()]
         parent.addChildNode(node)
     }
@@ -624,6 +733,7 @@ final class ARViewModel: ObservableObject {
         instanceCountByLabel.removeAll()
         selectedId = nil
         offscreenHint = nil
+        lastTickTime = nil
     }
 }
 
