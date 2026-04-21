@@ -6,9 +6,13 @@
 //
 
 import SwiftUI
+import Combine
 
 struct ContentView: View {
     @StateObject private var viewModel = ARViewModel()
+    /// Ticks ~20 Hz while a detection is selected, so the off-screen arrow keeps
+    /// pointing toward the target as the camera moves.
+    private let arrowTick = Timer.publish(every: 0.05, on: .main, in: .common).autoconnect()
 
     var body: some View {
         ZStack {
@@ -31,15 +35,27 @@ struct ContentView: View {
             }
             .animation(.easeInOut(duration: 0.25), value: viewModel.lastAdded)
 
-            // Detection cards at bottom left
+            // Detection cards at bottom left (scrollable)
             if !viewModel.detections.isEmpty {
                 VStack {
                     Spacer()
                     HStack {
                         VStack(alignment: .leading, spacing: 6) {
-                            ForEach(Array(viewModel.detections.enumerated()), id: \.element.id) { i, det in
-                                DetectionCard(detection: det, color: boxColor(i))
+                            ScrollView(.vertical, showsIndicators: false) {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    ForEach(Array(viewModel.detections.enumerated()), id: \.element.id) { i, det in
+                                        DetectionCard(
+                                            detection: det,
+                                            color: boxColor(i),
+                                            selected: viewModel.selectedId == det.id
+                                        )
+                                        .onLongPressGesture(minimumDuration: 0.35) {
+                                            viewModel.toggleSelect(det.id)
+                                        }
+                                    }
+                                }
                             }
+                            .frame(maxHeight: 320)
                             Button(action: { viewModel.clearBoxes() }) {
                                 HStack(spacing: 6) {
                                     Image(systemName: "trash")
@@ -59,6 +75,12 @@ struct ContentView: View {
                     }
                     .padding(.bottom, 80)
                 }
+            }
+
+            // Off-screen arrow pointing to selected object.
+            if let hint = viewModel.offscreenHint {
+                OffscreenArrow(hint: hint)
+                    .allowsHitTesting(false)
             }
 
             // Confidence slider bottom right
@@ -114,19 +136,25 @@ struct ContentView: View {
                 .padding(.trailing, 20)
             }
         }
+        .onReceive(arrowTick) { _ in
+            if viewModel.selectedId != nil {
+                viewModel.updateOffscreenHint()
+            }
+        }
     }
 }
 
 struct DetectionCard: View {
     let detection: DetectionInfo
     let color: Color
+    var selected: Bool = false
 
     var body: some View {
         HStack(spacing: 8) {
             Circle()
                 .fill(color)
                 .frame(width: 10, height: 10)
-            Text(detection.label)
+            Text("\(detection.label) #\(detection.instanceIndex)")
                 .font(.system(size: 13, weight: .bold))
                 .foregroundColor(.white)
             Text(String(format: "%.0fx%.0fx%.0f",
@@ -141,8 +169,26 @@ struct DetectionCard: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(.black.opacity(0.6))
+        .background(selected ? Color.yellow.opacity(0.85) : .black.opacity(0.6))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color.yellow, lineWidth: selected ? 2 : 0)
+        )
         .cornerRadius(6)
+        .animation(.easeInOut(duration: 0.15), value: selected)
+    }
+}
+
+struct OffscreenArrow: View {
+    let hint: OffscreenHint
+
+    var body: some View {
+        Image(systemName: hint.behind ? "arrow.uturn.backward.circle.fill" : "arrowtriangle.right.fill")
+            .font(.system(size: 36, weight: .bold))
+            .foregroundStyle(Color.yellow)
+            .shadow(color: .black.opacity(0.5), radius: 4)
+            .rotationEffect(.radians(hint.behind ? 0 : hint.angle))
+            .position(hint.position)
     }
 }
 

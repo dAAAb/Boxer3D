@@ -7,15 +7,29 @@ import simd
 struct DetectionInfo: Identifiable {
     let id = UUID()
     let label: String
+    let instanceIndex: Int
     let size: simd_float3
     let confidence: Float
 }
 
 private struct KnownDetection {
+    let id: UUID
     let label: String
+    let instanceIndex: Int
     let worldCenter: simd_float3
     let size: simd_float3
     let node: SCNNode
+    let wireframeNode: SCNNode
+}
+
+/// Screen-space guidance for an off-screen selected object.
+struct OffscreenHint {
+    /// Angle in radians from screen centre to the clamped arrow position.
+    let angle: Double
+    /// Clamped position along the screen edge (in view points).
+    let position: CGPoint
+    /// True when the target is behind the camera (arrow should flip / show 180°).
+    let behind: Bool
 }
 
 @MainActor
@@ -27,6 +41,8 @@ final class ARViewModel: ObservableObject {
     @Published var streamMode: Bool = false
     @Published var lastAdded: String? = nil
     @Published var lastCycleMs: Int = 0
+    @Published var selectedId: UUID? = nil
+    @Published var offscreenHint: OffscreenHint? = nil
 
     var sceneView: ARSCNView?
     private var boxerNet: BoxerNet?
@@ -34,6 +50,9 @@ final class ARViewModel: ObservableObject {
     private var known: [KnownDetection] = []
     private var cycleStart: Date?
     private var lastAddedClearTask: Task<Void, Never>?
+    /// Running count of detections per class, used to number instances
+    /// ("bottle #3"). Reset on clearBoxes.
+    private var instanceCountByLabel: [String: Int] = [:]
     private var memoryWarningObserver: NSObjectProtocol?
     private var lastDetectionCameraTransform: simd_float4x4?
     private var motionCheckTask: Task<Void, Never>?
@@ -212,6 +231,94 @@ final class ARViewModel: ObservableObject {
         }
     }
 
+    /// Toggle long-press selection on a detection. Yellow pulsing wireframe
+    /// when selected; plain white when deselected.
+    func toggleSelect(_ id: UUID) {
+        if selectedId == id {
+            setHighlight(nil)
+            selectedId = nil
+        } else {
+            setHighlight(id)
+            selectedId = id
+        }
+    }
+
+    private func setHighlight(_ id: UUID?) {
+        // Reset all wireframes.
+        for k in known {
+            k.wireframeNode.removeAction(forKey: "pulse")
+            k.wireframeNode.simdScale = simd_float3(1, 1, 1)
+            k.wireframeNode.geometry?.firstMaterial?.diffuse.contents = UIColor.white
+        }
+        guard let id, let target = known.first(where: { $0.id == id }) else { return }
+        target.wireframeNode.geometry?.firstMaterial?.diffuse.contents = UIColor.systemYellow
+        let pulse = SCNAction.sequence([
+            SCNAction.scale(to: 1.12, duration: 0.45),
+            SCNAction.scale(to: 1.00, duration: 0.45),
+        ])
+        target.wireframeNode.runAction(SCNAction.repeatForever(pulse), forKey: "pulse")
+    }
+
+    /// Called from a 20 Hz timer in ContentView — compute off-screen hint for
+    /// the currently selected object, or clear it when selected is visible.
+    func updateOffscreenHint() {
+        guard let sceneView, let id = selectedId,
+              let k = known.first(where: { $0.id == id }),
+              let frame = sceneView.session.currentFrame else {
+            if offscreenHint != nil { offscreenHint = nil }
+            return
+        }
+        let bounds = sceneView.bounds
+        guard bounds.width > 1 else { return }
+
+        // World → camera-local. ARKit: -Z forward, +Y up in camera space.
+        let camInv = frame.camera.transform.inverse
+        let p4 = simd_float4(k.worldCenter.x, k.worldCenter.y, k.worldCenter.z, 1)
+        let pCam = camInv * p4
+        let behind = pCam.z >= 0   // +z is behind in ARKit camera local
+
+        let projected = sceneView.projectPoint(
+            SCNVector3(k.worldCenter.x, k.worldCenter.y, k.worldCenter.z))
+        let screenX = CGFloat(projected.x)
+        let screenY = CGFloat(projected.y)
+
+        // On-screen and in front → no hint.
+        let onScreen = !behind
+            && screenX >= 0 && screenX <= bounds.width
+            && screenY >= 0 && screenY <= bounds.height
+        if onScreen {
+            if offscreenHint != nil { offscreenHint = nil }
+            return
+        }
+
+        // Compute direction from screen centre toward the target (flip if behind).
+        let cx = bounds.midX, cy = bounds.midY
+        var dx = screenX - cx
+        var dy = screenY - cy
+        if behind {
+            dx = -dx; dy = -dy
+            if dx == 0 && dy == 0 { dy = 1 }
+        }
+        let angle = atan2(dy, dx)
+
+        // Clamp arrow position to a ring just inside the screen edge.
+        let margin: CGFloat = 46
+        let maxX = bounds.width - margin
+        let maxY = bounds.height - margin
+        let scale = min(
+            (dx > 0 ? (maxX - cx) : (margin - cx)) / (dx == 0 ? 1 : dx),
+            (dy > 0 ? (maxY - cy) : (margin - cy)) / (dy == 0 ? 1 : dy)
+        )
+        let edgeX = cx + dx * max(0, scale)
+        let edgeY = cy + dy * max(0, scale)
+
+        offscreenHint = OffscreenHint(
+            angle: Double(angle),
+            position: CGPoint(x: edgeX, y: edgeY),
+            behind: behind
+        )
+    }
+
     func toggleStream() {
         streamMode.toggle()
         if streamMode {
@@ -254,17 +361,32 @@ final class ARViewModel: ObservableObject {
         let yoloImage = await yoloImageT
         let depthMap = await depthMapT
 
-        // 2. YOLO 2D detection.
-        let yoloBoxes = try yolo.detect(image: yoloImage, imageWidth: 640, imageHeight: 640)
+        // 2. Run in parallel: YOLO 2D detection AND depth-map-heavy BoxerNet
+        //    prep (gravity align + SDP patches + Plücker rays). They don't
+        //    depend on each other — only bb2d couples them downstream.
+        let camTransform = frame.camera.transform
+        let scaledIntrinsics = scaleIntrinsicsWithCrop(
+            frame.camera.intrinsics,
+            from: frame.camera.imageResolution,
+            toSize: BoxerNet.imageSize
+        )
+        async let yoloT = Task.detached(priority: .userInitiated) {
+            try yolo.detect(image: yoloImage, imageWidth: 640, imageHeight: 640)
+        }.value
+        async let prepT = Task.detached(priority: .userInitiated) {
+            boxer.prepareDepthInputs(depthMap: depthMap, intrinsics: scaledIntrinsics,
+                                     cameraTransform: camTransform)
+        }.value
+        let yoloBoxes = try await yoloT
+        let prep = await prepT
+
         guard !yoloBoxes.isEmpty else {
             await MainActor.run { self.setStatusIdle("No objects detected") }
             return []
         }
 
-        // 2b. Drop YOLO boxes that cover a known 3D detection (same label, projected
-        //     center falls inside the YOLO box). Frees BoxerNet slots for new objects.
+        // 2b. Drop YOLO boxes that cover a known 3D detection.
         let knownSnapshot = await MainActor.run { self.known }
-        let camTransform = frame.camera.transform
         let camIntrinsics = frame.camera.intrinsics
         let imageSize = frame.camera.imageResolution
         let filteredYolo = yoloBoxes.filter { yBox in
@@ -283,7 +405,7 @@ final class ARViewModel: ObservableObject {
         }
         let topBoxes = Array(filteredYolo.sorted { $0.score > $1.score }.prefix(BoxerNet.numBoxes))
 
-        // 3. Scale YOLO boxes (640 → 960) for BoxerNet.
+        // 3. Scale YOLO boxes (640 → imageSize) for BoxerNet.
         let scale = Float(BoxerNet.imageSize) / 640.0
         let boxes2D = topBoxes.map { box in
             Box2D(xmin: box.xmin * scale, ymin: box.ymin * scale,
@@ -291,18 +413,14 @@ final class ARViewModel: ObservableObject {
                   label: box.label, score: box.score)
         }
 
-        // 4. Scale intrinsics for center-cropped image.
-        let intrinsics = scaleIntrinsicsWithCrop(
-            frame.camera.intrinsics,
-            from: frame.camera.imageResolution,
-            toSize: BoxerNet.imageSize
-        )
-
-        // 5. BoxerNet 3D lifting.
+        // 4. BoxerNet 3D lifting using pre-computed prep.
         let conf = await MainActor.run { self.confidenceThreshold }
         let detections = try boxer.predict(
-            image: boxerImage, depthMap: depthMap, intrinsics: intrinsics,
-            cameraTransform: frame.camera.transform, boxes2D: boxes2D,
+            image: boxerImage,
+            sdpPatches: prep.sdpPatches,
+            rayEncoding: prep.rayEncoding,
+            T_wv: prep.T_wv,
+            boxes2D: boxes2D,
             confidenceThreshold: conf
         )
 
@@ -313,12 +431,17 @@ final class ARViewModel: ObservableObject {
     // MARK: - 3D Box Rendering
 
     private func placeBoxes(_ detections: [Detection3D], in sceneView: ARSCNView) {
-        var addedLabels: [String] = []
+        var addedTags: [String] = []
         for det in detections {
             let label = det.label ?? "object"
             let center = simd_make_float3(det.worldTransform.columns.3)
             if isDuplicate(label: label, center: center, size: det.size) { continue }
-            addedLabels.append(label)
+
+            // Next sequential index for this class: "bottle #1", "bottle #2", …
+            let nextIdx = (instanceCountByLabel[label] ?? 0) + 1
+            instanceCountByLabel[label] = nextIdx
+            let tag = "\(label) #\(nextIdx)"
+            addedTags.append(tag)
 
             // Semi-transparent white fill — Tesla-style proxy.
             let box = SCNBox(width: CGFloat(det.size.x), height: CGFloat(det.size.y),
@@ -331,18 +454,17 @@ final class ARViewModel: ObservableObject {
             let node = SCNNode(geometry: box)
             node.simdWorldTransform = det.worldTransform
 
-            addWireframe(to: node, size: det.size, color: .white, radius: 0.005)
-
-            let sizeStr = String(format: "%.0fx%.0fx%.0f cm",
-                                 det.size.x * 100, det.size.y * 100, det.size.z * 100)
-            addLabel("\(label)\n\(sizeStr)", to: node, offset: det.size.y / 2 + 0.03)
+            let wireframeNode = addWireframe(to: node, size: det.size, color: .white, radius: 0.005)
+            addLabel(tag, to: node, offset: det.size.y / 2 + 0.03)
 
             sceneView.scene.rootNode.addChildNode(node)
-            known.append(KnownDetection(label: label, worldCenter: center, size: det.size, node: node))
 
-            self.detections.append(DetectionInfo(
-                label: label, size: det.size, confidence: det.confidence
-            ))
+            let info = DetectionInfo(label: label, instanceIndex: nextIdx,
+                                     size: det.size, confidence: det.confidence)
+            known.append(KnownDetection(id: info.id, label: label, instanceIndex: nextIdx,
+                                        worldCenter: center, size: det.size,
+                                        node: node, wireframeNode: wireframeNode))
+            self.detections.append(info)
 
             if known.count >= Self.maxKnown {
                 if streamMode { toggleStream() }
@@ -350,8 +472,8 @@ final class ARViewModel: ObservableObject {
                 break
             }
         }
-        if !addedLabels.isEmpty {
-            flashAdded(addedLabels.joined(separator: ", "))
+        if !addedTags.isEmpty {
+            flashAdded(addedTags.joined(separator: ", "))
         }
     }
 
@@ -365,23 +487,35 @@ final class ARViewModel: ObservableObject {
         }
     }
 
-    /// Treat a new detection as a duplicate of an existing one when all three
-    /// conditions hold: (a) same label, (b) centre offset < 20% of the average
-    /// max-dimension, (c) volume ratio (smaller/larger) > 0.8.
-    /// Previously used only centre-distance, which let distinct objects of the
-    /// same class at similar spots get merged while also keeping re-detections
-    /// of the same object at slightly different positions.
+    /// Dedup: two passes.
+    /// 1. **Same label** — loose thresholds, tolerates position drift from the
+    ///    480-input noise. Two same-class objects need to be >1 full extent
+    ///    apart to count as distinct.
+    /// 2. **Cross label** — tight overlap + similar volume. Catches YOLO class
+    ///    flip-flops (cup ↔ bottle ↔ wine glass, which COCO classes routinely
+    ///    confuse) on the same physical object.
     private func isDuplicate(label: String, center: simd_float3, size: simd_float3) -> Bool {
         let newVol = size.x * size.y * size.z
         let newMaxDim = max(size.x, max(size.y, size.z))
-        for k in known where k.label == label {
+        for k in known {
             let kMaxDim = max(k.size.x, max(k.size.y, k.size.z))
-            let avgMaxDim = (newMaxDim + kMaxDim) * 0.5
             let dist = simd_distance(k.worldCenter, center)
-            guard dist < 0.20 * avgMaxDim else { continue }
             let kVol = k.size.x * k.size.y * k.size.z
             let volRatio = min(newVol, kVol) / max(newVol, kVol)
-            if volRatio > 0.80 { return true }
+
+            if k.label == label {
+                // Same label: overlap if centre distance < sum of half-max-dims.
+                if dist < (newMaxDim + kMaxDim) * 0.5 && volRatio > 0.20 {
+                    return true
+                }
+            } else {
+                // Different label: stricter — centres must be well inside each
+                // other's extent (avg half-max) and volumes within 2×.
+                let avgHalf = (newMaxDim + kMaxDim) * 0.25
+                if dist < avgHalf && volRatio > 0.5 {
+                    return true
+                }
+            }
         }
         return false
     }
@@ -390,7 +524,9 @@ final class ARViewModel: ObservableObject {
     /// triangular tube (radius = `radius` metres). All 12 tubes merge into a
     /// single SCNGeometry so it stays 1 node + 1 draw call per box — same cost
     /// as the line-primitive version but with configurable line thickness.
-    private func addWireframe(to parent: SCNNode, size: simd_float3, color: UIColor, radius: Float) {
+    /// Returns the attached wireframe node so callers can animate / recolour it.
+    @discardableResult
+    private func addWireframe(to parent: SCNNode, size: simd_float3, color: UIColor, radius: Float) -> SCNNode {
         let hw = size.x / 2, hh = size.y / 2, hd = size.z / 2
         let corners: [simd_float3] = [
             simd_float3(-hw, -hh, -hd), simd_float3( hw, -hh, -hd),
@@ -461,16 +597,22 @@ final class ARViewModel: ObservableObject {
 
         let geometry = SCNGeometry(sources: [vertexSource, normalSource], elements: [element])
         geometry.materials = [material]
-        parent.addChildNode(SCNNode(geometry: geometry))
+        let wireframeNode = SCNNode(geometry: geometry)
+        parent.addChildNode(wireframeNode)
+        return wireframeNode
     }
 
     private func addLabel(_ text: String, to parent: SCNNode, offset: Float) {
-        let scnText = SCNText(string: text, extrusionDepth: 0.005)
-        scnText.font = UIFont.systemFont(ofSize: 0.03, weight: .bold)
+        let scnText = SCNText(string: text, extrusionDepth: 0.003)
+        scnText.font = UIFont.systemFont(ofSize: 0.022, weight: .semibold)
         scnText.firstMaterial?.diffuse.contents = UIColor.white
+        scnText.firstMaterial?.lightingModel = .constant   // no shading, crisper
         scnText.flatness = 0.1
         let node = SCNNode(geometry: scnText)
-        node.position = SCNVector3(-0.05, offset, 0)
+        // Centre the text roughly above the box (SCNText origin is bottom-left).
+        let bbox = scnText.boundingBox
+        let textWidth = Float(bbox.max.x - bbox.min.x)
+        node.position = SCNVector3(-textWidth / 2, offset, 0)
         node.constraints = [SCNBillboardConstraint()]
         parent.addChildNode(node)
     }
@@ -479,6 +621,9 @@ final class ARViewModel: ObservableObject {
         known.forEach { $0.node.removeFromParentNode() }
         known.removeAll()
         detections.removeAll()
+        instanceCountByLabel.removeAll()
+        selectedId = nil
+        offscreenHint = nil
     }
 }
 

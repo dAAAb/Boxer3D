@@ -48,9 +48,12 @@ class BoxerNetTensorOnly(nn.Module):
         self.min_dim = float(boxer.head.min_dim)
         self.yaw_max = float(np.pi / 2)
 
-        # Static shapes — matches hw960 in4 checkpoint.
-        self.fH = 60
-        self.fW = 60
+        # Static shapes — 480 input, 16-px patches → 30×30 = 900 tokens.
+        # DINOv3 RoPE is computed per-forward from H, W so arbitrary multiples
+        # of the patch size work without architectural changes; accuracy may
+        # drift vs. the 960-trained checkpoint until fine-tuned.
+        self.fH = 30
+        self.fW = 30
         self.num_patches = self.fH * self.fW
 
     def forward(self, img, sdp_median, ray_enc, bb2d_norm):

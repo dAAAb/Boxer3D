@@ -32,9 +32,9 @@ def main():
     mlmodel = ct.models.MLModel(str(mlpackage), compute_units=ct.ComputeUnit.CPU_ONLY)
 
     torch.manual_seed(0)
-    img = torch.rand(1, 3, 960, 960)
-    sdp = torch.rand(1, 1, 60, 60) * 3.0  # depth in metres
-    ray = torch.randn(1, 3600, 6)
+    img = torch.rand(1, 3, 480, 480)
+    sdp = torch.rand(1, 1, 30, 30) * 3.0  # depth in metres
+    ray = torch.randn(1, 900, 6)
     bb2d = torch.tensor(
         [[[0.15, 0.55, 0.12, 0.58], [0.30, 0.80, 0.25, 0.75], [0.05, 0.45, 0.50, 0.95]]]
     )

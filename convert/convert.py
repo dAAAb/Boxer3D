@@ -64,9 +64,9 @@ def main():
     wrapper = BoxerNetTensorOnly(boxer).eval()
 
     print("[2/5] Sanity-checking wrapper forward")
-    img = torch.rand(1, 3, 960, 960)
-    sdp = torch.rand(1, 1, 60, 60)
-    ray = torch.rand(1, 3600, 6)
+    img = torch.rand(1, 3, 480, 480)
+    sdp = torch.rand(1, 1, 30, 30)
+    ray = torch.rand(1, 900, 6)
     bb2d = torch.tensor(
         [[[0.1, 0.5, 0.1, 0.5], [0.2, 0.6, 0.2, 0.6], [0.3, 0.7, 0.3, 0.7]]]
     )

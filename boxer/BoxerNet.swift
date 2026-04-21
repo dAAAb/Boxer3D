@@ -52,14 +52,16 @@ struct Box2D {
 final class BoxerNet: @unchecked Sendable {
     private let model: MLModel
 
-    /// Image size the model expects (960x960).
-    static let imageSize: Int = 960
+    /// Image size the model expects. Halved from 960 to 480 (Boxer3D Flash Lv 2)
+    /// — 4-6× speedup since DINOv3 self-attn is O(N²) in token count.
+    /// Accuracy may drift vs. the 960-trained checkpoint until fine-tuned.
+    static let imageSize: Int = 480
     /// Patch size used by DINOv3.
     static let patchSize: Int = 16
     /// Feature grid dimensions.
-    static let gridH: Int = imageSize / patchSize  // 60
-    static let gridW: Int = imageSize / patchSize  // 60
-    static let numPatches: Int = gridH * gridW     // 3600
+    static let gridH: Int = imageSize / patchSize  // 30
+    static let gridW: Int = imageSize / patchSize  // 30
+    static let numPatches: Int = gridH * gridW     // 900
 
     /// Fixed number of boxes this (static-shape) model expects per call.
     /// Must match `num_boxes` baked into the converted .mlpackage.
@@ -96,24 +98,21 @@ final class BoxerNet: @unchecked Sendable {
     ///   - boxes2D: Array of YOLO 2D detections in pixel coords (for the 960x960 image).
     ///   - confidenceThreshold: Minimum confidence to keep a detection.
     /// - Returns: Array of 3D detections in world coordinates.
-    nonisolated func predict(
-        image: [Float],            // CHW flat array, len = 3 * 960 * 960
-        depthMap: [[Float]],       // HxW depth in metres (0 = invalid)
-        intrinsics: simd_float3x3, // fx, fy, cx, cy from ARKit
-        cameraTransform: simd_float4x4,
-        boxes2D: [Box2D],
-        confidenceThreshold: Float = 0.3
-    ) throws -> [Detection3D] {
-        guard !boxes2D.isEmpty else { return [] }
-
+    /// Depth-map-heavy preprocessing that can run in parallel with YOLO:
+    /// gravity-aligned voxel frame, SDP patches, Plücker ray encoding.
+    /// Returns everything the inference step needs plus the voxel→world
+    /// transform for post-processing.
+    nonisolated func prepareDepthInputs(
+        depthMap: [[Float]],
+        intrinsics: simd_float3x3,
+        cameraTransform: simd_float4x4
+    ) -> (sdpPatches: [Float], rayEncoding: [Float], T_wv: simd_float4x4) {
         let fx = intrinsics[0][0]
         let fy = intrinsics[1][1]
         let cx = intrinsics[2][0]
         let cy = intrinsics[2][1]
 
-        // 1. Convert ARKit camera (OpenGL: -Z forward, Y up) to
-        //    OpenCV convention (Z forward, Y down) that BoxerNet expects.
-        //    Flip Y and Z axes of the camera local frame.
+        // ARKit (-Z forward, +Y up) → OpenCV (+Z forward, +Y down) camera local.
         let flipYZ = simd_float4x4(columns: (
             simd_float4( 1,  0,  0, 0),
             simd_float4( 0, -1,  0, 0),
@@ -121,19 +120,45 @@ final class BoxerNet: @unchecked Sendable {
             simd_float4( 0,  0,  0, 1)
         ))
         let T_wc = cameraTransform * flipYZ
-
-        // Gravity-aligned voxel frame.
         let T_wv = gravityAlign(T_worldCam: T_wc)
         let T_vc = T_wv.inverse * T_wc
 
-        // 2. Build SDP patches (median LiDAR depth per 16x16 patch).
-        let sdpPatches = buildSDPPatches(
-            depthMap: depthMap,
-            fx: fx, fy: fy, cx: cx, cy: cy
-        )
+        let sdp = buildSDPPatches(depthMap: depthMap, fx: fx, fy: fy, cx: cx, cy: cy)
+        let ray = buildRayEncoding(T_vc: T_vc, fx: fx, fy: fy, cx: cx, cy: cy)
+        return (sdp, ray, T_wv)
+    }
 
-        // 3. Normalise 2D boxes. Model input is fixed shape [1, numBoxes, 4] —
-        //    pad unused slots with zeros; their outputs are discarded below.
+    /// Back-compat: do the prep here, then run inference. Kept so the old
+    /// call-site signature still works.
+    nonisolated func predict(
+        image: [Float],
+        depthMap: [[Float]],
+        intrinsics: simd_float3x3,
+        cameraTransform: simd_float4x4,
+        boxes2D: [Box2D],
+        confidenceThreshold: Float = 0.3
+    ) throws -> [Detection3D] {
+        guard !boxes2D.isEmpty else { return [] }
+        let prep = prepareDepthInputs(depthMap: depthMap, intrinsics: intrinsics,
+                                      cameraTransform: cameraTransform)
+        return try predict(image: image, sdpPatches: prep.sdpPatches,
+                           rayEncoding: prep.rayEncoding, T_wv: prep.T_wv,
+                           boxes2D: boxes2D, confidenceThreshold: confidenceThreshold)
+    }
+
+    /// Main inference path — takes pre-computed depth-map prep tensors so the
+    /// caller can overlap this step with an independent task (e.g. YOLO).
+    nonisolated func predict(
+        image: [Float],
+        sdpPatches: [Float],
+        rayEncoding: [Float],
+        T_wv: simd_float4x4,
+        boxes2D: [Box2D],
+        confidenceThreshold: Float = 0.3
+    ) throws -> [Detection3D] {
+        guard !boxes2D.isEmpty else { return [] }
+
+        // Normalise 2D boxes. Model input shape is [1, numBoxes, 4]; pad slots.
         let W = Float(Self.imageSize)
         let H = Float(Self.imageSize)
         let validM = min(boxes2D.count, Self.numBoxes)
@@ -146,10 +171,6 @@ final class BoxerNet: @unchecked Sendable {
             bb2dFlat[idx * 4 + 3] = (box.ymax + 0.5) / H
         }
 
-        // 4. Compute Plucker ray encoding.
-        let rayEncoding = buildRayEncoding(T_vc: T_vc, fx: fx, fy: fy, cx: cx, cy: cy)
-
-        // 5. Run ONNX inference — always at the model's fixed numBoxes.
         let (centers, sizes, yaws, confidences) = try runInference(
             image: image,
             sdpPatches: sdpPatches,
@@ -158,7 +179,6 @@ final class BoxerNet: @unchecked Sendable {
             numBoxes: Self.numBoxes
         )
 
-        // 6. Postprocess only the valid boxes; discard padding outputs.
         var detections: [Detection3D] = []
         for i in 0..<validM {
             let conf = confidences[i]
