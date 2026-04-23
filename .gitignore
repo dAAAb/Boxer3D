@@ -26,3 +26,8 @@ boxer/README.md
 boxer/README.md.*
 boxer/*.onnx.lock
 boxer/*.onnx.metadata
+
+# Obsidian — per-user editor state (shared config like graph.json stays tracked)
+wiki/.obsidian/workspace.json
+wiki/.obsidian/workspace-mobile.json
+wiki/.obsidian/cache

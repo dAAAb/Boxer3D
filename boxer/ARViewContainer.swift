@@ -9,12 +9,35 @@ struct ARViewContainer: UIViewRepresentable {
         let sceneView = ARSCNView()
         sceneView.autoenablesDefaultLighting = true
         sceneView.automaticallyUpdatesLighting = true
+        // 2× MSAA softens silhouette aliasing on the low-poly ghost meshes
+        // without the GPU cost of 4× (4× was perceptibly dropping frame rate).
+        sceneView.antialiasingMode = .multisampling2X
 
-        // Configure AR session with LiDAR. Plane detection disabled — we don't
-        // use planes, and it eats noticeable memory / compute per frame.
+        // Extra ambient fill so the unlit side of the ghost mesh doesn't go
+        // pitch-black. The default-lighting omnidirectional alone produces
+        // very high shadow contrast on the cup's handle/side.
+        let ambient = SCNNode()
+        ambient.light = SCNLight()
+        ambient.light!.type = .ambient
+        ambient.light!.color = UIColor(white: 0.7, alpha: 1.0)
+        sceneView.scene.rootNode.addChildNode(ambient)
+
+        // Configure AR session with LiDAR.
         let config = ARWorldTrackingConfiguration()
         config.frameSemantics = [.sceneDepth]
+        // Plane detection drives the Tesla "feel the road" dot overlay in FSD
+        // mode — clean flat planes from ARKit beat the raw jagged scene-recon
+        // mesh on floors / tables / walls. Horizontal = floors + tables + seat
+        // tops, vertical = walls. Cost is a few ms/frame, acceptable on A17.
+        config.planeDetection = [.horizontal, .vertical]
+        // Scene reconstruction feeds FSD mode's environment mesh (for things
+        // plane detection doesn't cover — ceilings, furniture curves). Always
+        // on so the first FSD toggle is instant; iPhone 15 Pro Max supports it.
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
+            config.sceneReconstruction = .meshWithClassification
+        }
 
+        sceneView.delegate = viewModel
         sceneView.session.run(config)
         viewModel.setup(sceneView: sceneView)
 

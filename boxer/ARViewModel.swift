@@ -22,6 +22,9 @@ private struct KnownDetection {
     let size: simd_float3
     let node: SCNNode
     let wireframeNode: SCNNode
+    /// Soft radial shadow decal under the object, hidden in camera mode.
+    /// nil only if contact-shadow creation was skipped.
+    let shadowNode: SCNNode?
     /// Latest observed transform (match target for the tween).
     var targetTransform: simd_float4x4
     /// Spring-damped velocity per axis (m/s).
@@ -47,7 +50,7 @@ struct OffscreenHint {
 }
 
 @MainActor
-final class ARViewModel: ObservableObject {
+final class ARViewModel: NSObject, ObservableObject {
     @Published var status: String = "Initializing..."
     @Published var isProcessing: Bool = false
     @Published var detections: [DetectionInfo] = []
@@ -57,10 +60,31 @@ final class ARViewModel: ObservableObject {
     @Published var lastCycleMs: Int = 0
     @Published var selectedId: UUID? = nil
     @Published var offscreenHint: OffscreenHint? = nil
+    /// Explicit 4-state cycle replaces the old Bool toggle (which gave an
+    /// accidental 3-state behaviour because `scene.background.contents = nil`
+    /// doesn't reliably restore the ARSCNView camera feed). See FSDRenderMode.
+    @Published var renderMode: FSDRenderMode = .camera
+
+    /// Scene-reconstruction mesh nodes keyed by ARMeshAnchor.identifier.
+    /// Populated regardless of render mode (so the mesh is ready the moment
+    /// the user toggles in), but hidden unless the mode shows environment.
+    private var sceneReconNodes: [UUID: SCNNode] = [:]
+
+    /// Live ARMeshAnchor references kept in sync with sceneReconNodes — the
+    /// plane overlay needs to read `.floor/.table` classified vertices to
+    /// compute a robust surface Y, sidestepping ARKit's plane-fit upward
+    /// bias from objects sitting on the surface.
+    private var meshAnchors: [UUID: ARMeshAnchor] = [:]
+
+    /// ARPlaneAnchor-backed dot overlay nodes keyed by anchor identifier.
+    /// Enables the Tesla "feel the road" look on detected horizontal /
+    /// vertical planes.
+    private var planeOverlayNodes: [UUID: SCNNode] = [:]
 
     var sceneView: ARSCNView?
     private var boxerNet: BoxerNet?
     private var yoloDetector: YOLODetector?
+    private let meshLibrary = MeshLibrary()
     private var known: [KnownDetection] = []
     private var cycleStart: Date?
     private var lastAddedClearTask: Task<Void, Never>?
@@ -77,6 +101,8 @@ final class ARViewModel: ObservableObject {
     /// Incremented each cycle. If memory warning fires mid-predict, we bump this so
     /// the in-flight Task's completion is discarded instead of updating the scene.
     private var cycleToken: Int = 0
+
+    override init() { super.init() }
 
     /// Hard cap on accumulated detections. With native CoreML (single 192 MB
     /// mlpackage, no ORT doubling) + line-primitive wireframes (2 nodes/box
@@ -252,19 +278,39 @@ final class ARViewModel: ObservableObject {
     }
 
     private func setHighlight(_ id: UUID?) {
-        // Reset all wireframes.
+        // Reset all highlights.
         for k in known {
             k.wireframeNode.removeAction(forKey: "pulse")
             k.wireframeNode.simdScale = simd_float3(1, 1, 1)
-            k.wireframeNode.geometry?.firstMaterial?.diffuse.contents = UIColor.white
+            paintHighlight(on: k.wireframeNode, selected: false)
         }
         guard let id, let target = known.first(where: { $0.id == id }) else { return }
-        target.wireframeNode.geometry?.firstMaterial?.diffuse.contents = UIColor.systemYellow
+        paintHighlight(on: target.wireframeNode, selected: true)
         let pulse = SCNAction.sequence([
             SCNAction.scale(to: 1.12, duration: 0.45),
             SCNAction.scale(to: 1.00, duration: 0.45),
         ])
         target.wireframeNode.runAction(SCNAction.repeatForever(pulse), forKey: "pulse")
+    }
+
+    /// Wireframe nodes carry their SCNGeometry directly; mesh nodes from
+    /// MeshLibrary are an empty container wrapping geometry-bearing children.
+    /// For meshes we tint via `.multiply` so any baked AO texture on the
+    /// diffuse channel still shows through; wireframes have no texture and
+    /// swap `.diffuse.contents` directly.
+    private func paintHighlight(on node: SCNNode, selected: Bool) {
+        let isMesh = node.geometry == nil
+        if isMesh {
+            let tint: UIColor = selected
+                ? UIColor(red: 1.0, green: 0.92, blue: 0.55, alpha: 1.0)  // 淡鵝黃
+                : UIColor.white
+            node.enumerateChildNodes { child, _ in
+                child.geometry?.firstMaterial?.multiply.contents = tint
+            }
+        } else {
+            node.geometry?.firstMaterial?.diffuse.contents =
+                selected ? UIColor.systemYellow : UIColor.white
+        }
     }
 
     /// Called from a 20 Hz timer in ContentView — compute off-screen hint for
@@ -396,6 +442,46 @@ final class ARViewModel: ObservableObject {
             motionCheckTask?.cancel()
             motionCheckTask = nil
             setStatusIdle("Ready")
+        }
+    }
+
+    /// Cycle the FSD render mode one step: camera → whiteOnWhite →
+    /// whiteOnDark → blackOnWhite → camera. All three non-camera modes
+    /// show the environment overlay (scene recon + plane dots); only
+    /// whiteOnDark repaints objects to fsdSolid — the others keep the
+    /// white ghost so you can still read them on the coloured background.
+    func toggleFsdMode() {
+        applyRenderMode(renderMode.next)
+    }
+
+    /// Apply a render mode without assuming the previous one — safe to call
+    /// from init or after state changes. Centralises every visual side-effect
+    /// of the mode (background, fog, overlay visibility, object palette).
+    func applyRenderMode(_ mode: FSDRenderMode) {
+        renderMode = mode
+        guard let sceneView else { return }
+
+        sceneView.scene.background.contents = mode.backgroundContents
+        if mode.usesFog {
+            sceneView.scene.fogColor = mode.fogColor
+            sceneView.scene.fogStartDistance = FSDStyle.fogStart
+            sceneView.scene.fogEndDistance = FSDStyle.fogEnd
+            sceneView.scene.fogDensityExponent = 2.0
+        } else {
+            sceneView.scene.fogStartDistance = 0
+            sceneView.scene.fogEndDistance = 0
+        }
+
+        let showEnv = mode.showsEnvironmentOverlay
+        for node in sceneReconNodes.values { node.isHidden = !showEnv }
+        for node in planeOverlayNodes.values { node.isHidden = !showEnv }
+
+        for k in known {
+            applyBoxerPalette(mode.boxerPalette, to: k.wireframeNode)
+            // Contact shadow makes objects "sit on" a surface. In camera mode
+            // the real scene's real shadows already do this job, so hide ours
+            // to avoid double-shadowing; show in all FSD modes.
+            k.shadowNode?.isHidden = !showEnv
         }
     }
 
@@ -534,17 +620,36 @@ final class ARViewModel: ObservableObject {
             let tag = "\(label) #\(nextIdx)"
             addedTags.append(tag)
 
-            let box = SCNBox(width: CGFloat(det.size.x), height: CGFloat(det.size.y),
-                             length: CGFloat(det.size.z), chamferRadius: 0)
-            let mat = SCNMaterial()
-            mat.diffuse.contents = UIColor.white.withAlphaComponent(0.15)
-            mat.isDoubleSided = true
-            box.materials = [mat]
-
-            let node = SCNNode(geometry: box)
+            // Anchor node: empty, carries the detection's world transform. The
+            // visual child is either a class-specific mesh (Tesla "ghost-proxy"
+            // look) or the generic translucent-box + wireframe fallback.
+            let node = SCNNode()
             node.simdWorldTransform = det.worldTransform
 
-            let wireframeNode = addWireframe(to: node, size: det.size, color: .white, radius: 0.005)
+            let wireframeNode: SCNNode
+            if let meshNode = meshLibrary.node(for: label) {
+                node.addChildNode(meshNode)
+                // Highlight + pulse still target this node so long-press works.
+                wireframeNode = meshNode
+            } else {
+                let box = SCNBox(width: CGFloat(det.size.x), height: CGFloat(det.size.y),
+                                 length: CGFloat(det.size.z), chamferRadius: 0)
+                let mat = SCNMaterial()
+                mat.diffuse.contents = UIColor.white.withAlphaComponent(0.15)
+                mat.isDoubleSided = true
+                box.materials = [mat]
+                node.addChildNode(SCNNode(geometry: box))
+                wireframeNode = addWireframe(to: node, size: det.size, color: .white, radius: 0.005)
+            }
+            // Apply the *current* render mode's palette so a detection made
+            // while in FSD whiteOnDark comes up dark immediately, not as a
+            // white ghost that only darkens on the next mode toggle.
+            applyBoxerPalette(renderMode.boxerPalette, to: wireframeNode)
+            // Soft radial shadow decal grounding the object on its surface
+            // — visible in FSD modes, hidden in camera mode (real shadows
+            // from the live scene already do this work there).
+            let shadowNode = addContactShadow(to: node, size: det.size)
+            shadowNode.isHidden = !renderMode.showsEnvironmentOverlay
             addLabel(tag, to: node, offset: det.size.y / 2 + 0.03)
 
             sceneView.scene.rootNode.addChildNode(node)
@@ -555,6 +660,7 @@ final class ARViewModel: ObservableObject {
                 id: info.id, label: label, instanceIndex: nextIdx,
                 worldCenter: center, size: det.size,
                 node: node, wireframeNode: wireframeNode,
+                shadowNode: shadowNode,
                 targetTransform: det.worldTransform,
                 velocity: .zero, lastSeen: now, reaping: false
             ))
@@ -734,6 +840,85 @@ final class ARViewModel: ObservableObject {
         selectedId = nil
         offscreenHint = nil
         lastTickTime = nil
+    }
+
+    // MARK: - Scene Reconstruction (FSD mode mesh)
+
+    fileprivate func attachSceneReconMesh(node: SCNNode, anchor: ARMeshAnchor) {
+        node.geometry = makeSceneReconGeometry(from: anchor.geometry)
+        node.isHidden = !renderMode.showsEnvironmentOverlay
+        sceneReconNodes[anchor.identifier] = node
+        meshAnchors[anchor.identifier] = anchor
+    }
+
+    fileprivate func refreshSceneReconMesh(node: SCNNode, anchor: ARMeshAnchor) {
+        node.geometry = makeSceneReconGeometry(from: anchor.geometry)
+        node.isHidden = !renderMode.showsEnvironmentOverlay
+        meshAnchors[anchor.identifier] = anchor
+    }
+
+    fileprivate func detachSceneReconMesh(anchor: ARMeshAnchor) {
+        sceneReconNodes.removeValue(forKey: anchor.identifier)
+        meshAnchors.removeValue(forKey: anchor.identifier)
+    }
+
+    // MARK: - Plane Overlay (Q4 — Tesla dot-grid on detected planes)
+
+    fileprivate func attachPlaneOverlay(node: SCNNode, anchor: ARPlaneAnchor) {
+        installDotOverlay(on: node, anchor: anchor,
+                          meshAnchors: Array(meshAnchors.values))
+        node.isHidden = !renderMode.showsEnvironmentOverlay
+        planeOverlayNodes[anchor.identifier] = node
+    }
+
+    fileprivate func refreshPlaneOverlay(node: SCNNode, anchor: ARPlaneAnchor) {
+        installDotOverlay(on: node, anchor: anchor,
+                          meshAnchors: Array(meshAnchors.values))
+        node.isHidden = !renderMode.showsEnvironmentOverlay
+    }
+
+    fileprivate func detachPlaneOverlay(anchor: ARPlaneAnchor) {
+        planeOverlayNodes.removeValue(forKey: anchor.identifier)
+    }
+}
+
+// MARK: - ARSCNViewDelegate (scene reconstruction mesh lifecycle)
+
+extension ARViewModel: ARSCNViewDelegate {
+    nonisolated func renderer(_ renderer: SCNSceneRenderer, didAdd node: SCNNode, for anchor: ARAnchor) {
+        if let meshAnchor = anchor as? ARMeshAnchor {
+            Task { @MainActor [weak self] in
+                self?.attachSceneReconMesh(node: node, anchor: meshAnchor)
+            }
+        } else if let planeAnchor = anchor as? ARPlaneAnchor {
+            Task { @MainActor [weak self] in
+                self?.attachPlaneOverlay(node: node, anchor: planeAnchor)
+            }
+        }
+    }
+
+    nonisolated func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
+        if let meshAnchor = anchor as? ARMeshAnchor {
+            Task { @MainActor [weak self] in
+                self?.refreshSceneReconMesh(node: node, anchor: meshAnchor)
+            }
+        } else if let planeAnchor = anchor as? ARPlaneAnchor {
+            Task { @MainActor [weak self] in
+                self?.refreshPlaneOverlay(node: node, anchor: planeAnchor)
+            }
+        }
+    }
+
+    nonisolated func renderer(_ renderer: SCNSceneRenderer, didRemove node: SCNNode, for anchor: ARAnchor) {
+        if let meshAnchor = anchor as? ARMeshAnchor {
+            Task { @MainActor [weak self] in
+                self?.detachSceneReconMesh(anchor: meshAnchor)
+            }
+        } else if let planeAnchor = anchor as? ARPlaneAnchor {
+            Task { @MainActor [weak self] in
+                self?.detachPlaneOverlay(anchor: planeAnchor)
+            }
+        }
     }
 }
 

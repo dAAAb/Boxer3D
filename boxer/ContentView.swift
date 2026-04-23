@@ -109,6 +109,8 @@ struct ContentView: View {
                     .foregroundColor(.white.opacity(0.8))
                     .padding(.trailing, 12)
                 VStack(spacing: 10) {
+                    FSDToggleButton(renderMode: viewModel.renderMode,
+                                    action: { viewModel.toggleFsdMode() })
                     StreamToggleButton(streamMode: viewModel.streamMode,
                                        action: { viewModel.toggleStream() })
                     Button(action: { viewModel.detectNow() }) {
@@ -209,6 +211,41 @@ struct StreamToggleButton: View {
                 Image(systemName: streamMode ? "stop.fill" : "infinity")
                     .font(.system(size: 18, weight: .bold))
                     .foregroundColor(.white)
+            }
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// FSD 4-state cycle button. Centre colour + label hint which state we're in:
+/// camera (black/"FSD") → whiteOnWhite (light blue/"W·W") → whiteOnDark
+/// (cyan/"W·D") → blackOnWhite (dark blue/"B·W") → back to camera.
+struct FSDToggleButton: View {
+    let renderMode: FSDRenderMode
+    let action: () -> Void
+
+    private var innerFill: Color {
+        switch renderMode {
+        case .camera:       return .black.opacity(0.7)
+        case .whiteOnWhite: return Color(red: 0.55, green: 0.85, blue: 1.0)
+        case .whiteOnDark:  return Color(red: 0.00, green: 0.70, blue: 1.0)
+        case .blackOnWhite: return Color(red: 0.10, green: 0.25, blue: 0.55)
+        }
+    }
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Circle().fill(.white).frame(width: 54, height: 54)
+                Circle()
+                    .fill(innerFill)
+                    .frame(width: 46, height: 46)
+                Text(renderMode.buttonLabel)
+                    .font(.system(size: renderMode == .camera ? 13 : 11,
+                                  weight: .heavy, design: .rounded))
+                    .foregroundColor(.white)
+                    .monospacedDigit()
             }
             .contentShape(Circle())
         }
