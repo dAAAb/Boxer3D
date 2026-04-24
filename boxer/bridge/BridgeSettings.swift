@@ -39,8 +39,12 @@ final class BridgeSettings: ObservableObject {
 
     private init() {
         self.enabled = UserDefaults.standard.bool(forKey: Keys.enabled)
+        // Placeholder on first launch — user configures their own host's
+        // LAN IP via the Bridge settings sheet. The failed connection under
+        // 0.0.0.0 surfaces as `state = .failed(...)` in the UI, prompting
+        // the user to open settings and enter a real address.
         self.urlString = UserDefaults.standard.string(forKey: Keys.url)
-            ?? "ws://192.168.22.92:8787"
+            ?? "ws://0.0.0.0:8787"
         let hz = UserDefaults.standard.double(forKey: Keys.rateHz)
         self.rateHz = hz > 0 ? hz : 10.0
         let yaw = UserDefaults.standard.integer(forKey: Keys.yawDeg)
