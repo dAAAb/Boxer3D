@@ -74,12 +74,35 @@ Both models run with ONNX Runtime CoreML Execution Provider for Metal/Neural Eng
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime-swift-package-manager) v1.24.2 (via SPM)
 - ARKit, SceneKit, SwiftUI (built-in)
 
+## Robot bridge (optional)
+
+`boxer/bridge/` contains a WebSocket streamer that publishes the current
+tracked detections as a `BridgeSceneReport` JSON to a host on the LAN. Pair
+it with [Boxer3D-Bridge](https://github.com/dAAAb/Boxer3D-Bridge) — a Vite +
+MuJoCo browser sim that mirrors your real-world objects and plans robot
+actions through Gemini Robotics-ER 1.6.
+
+To enable:
+
+1. Run the relay server on your Mac (see the Boxer3D-Bridge repo)
+2. In the Boxer3D app, tap the **bridge icon** in the toolbar (top-right,
+   next to FSD and Stream toggles)
+3. Turn **Stream detections** on and set the WebSocket URL to
+   `ws://<your-mac-ip>:8787` — the default is a deliberately-broken
+   `0.0.0.0` placeholder so you know to configure it
+4. Accept the Local Network permission iOS prompts for
+5. If the sim scene lands rotated, cycle the **World yaw** picker (0° / 90°
+   / 180° / 270°) until the orientation matches reality — this is the
+   stopgap until ARKit AprilTag calibration lands
+
 ## Roadmap
 
 - [x] Port BoxerNet to Swift
 - [x] Convert BoxerNet.pt to ONNX
 - [x] Upload ONNX weights for download
+- [x] Bridge module → Boxer3D-Bridge robot sim
 - [ ] Optimize for portrait mode
+- [ ] AprilTag hand-eye calibration (replaces the manual yaw workaround)
 
 ## Acknowledgments
 
