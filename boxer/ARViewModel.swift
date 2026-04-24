@@ -842,6 +842,62 @@ final class ARViewModel: NSObject, ObservableObject {
         lastTickTime = nil
     }
 
+    // MARK: - Bridge snapshot (for SceneReportStreamer)
+
+    /// Build a transport-ready snapshot of the current perception state for
+    /// the bridge WebSocket. Returns nil if there's no ARKit session yet —
+    /// we never publish without a camera pose, so the host can always rely
+    /// on `camera.pose_world` being meaningful when present.
+    ///
+    /// Coordinates are converted from ARKit world → MuJoCo world via a fixed
+    /// axis swap (see ``BridgeCoord/arkitToMujoco(_:)``). This is the
+    /// identity-calibration fallback used until Step 2e introduces AprilTag
+    /// hand-eye calibration; once that lands, the swap is the first stage of
+    /// a two-stage transform (arkit → session-arkit-base → arm-base).
+    ///
+    /// Size is forwarded as-is in `[x, y, z]` order because `KnownDetection`
+    /// doesn't separate object-local from world-aligned extents. Yaw is
+    /// currently zeroed for the same reason — recovering a faithful yaw from
+    /// `targetTransform` under the ARKit→MuJoCo swap is TODO for Step 2e.
+    func bridgeSnapshot() -> BridgeSceneReport? {
+        guard let frame = sceneView?.session.currentFrame else { return nil }
+
+        let cam = frame.camera.transform
+        let poseMujoco = BridgeCamera(
+            pose_world: Self.serializeTransform(cam),
+            image_size: nil
+        )
+
+        let objects: [BridgeObject] = known.map { k in
+            let centerMj = BridgeCoord.arkitToMujoco(k.worldCenter)
+            return BridgeObject(
+                id: k.id.uuidString,
+                label: k.label,
+                center_world: [centerMj.x, centerMj.y, centerMj.z],
+                size_m: [k.size.x, k.size.y, k.size.z],
+                yaw_rad: 0.0,
+                confidence: BridgeCoord.confidenceFromHits(k.hits)
+            )
+        }
+
+        return BridgeSceneReport(
+            version: 1,
+            coordinate_frame: "mujoco_world",
+            timestamp: Date().timeIntervalSince1970,
+            camera: poseMujoco,
+            objects: objects
+        )
+    }
+
+    private static func serializeTransform(_ m: simd_float4x4) -> [Float] {
+        [
+            m.columns.0.x, m.columns.0.y, m.columns.0.z, m.columns.0.w,
+            m.columns.1.x, m.columns.1.y, m.columns.1.z, m.columns.1.w,
+            m.columns.2.x, m.columns.2.y, m.columns.2.z, m.columns.2.w,
+            m.columns.3.x, m.columns.3.y, m.columns.3.z, m.columns.3.w,
+        ]
+    }
+
     // MARK: - Scene Reconstruction (FSD mode mesh)
 
     fileprivate func attachSceneReconMesh(node: SCNNode, anchor: ARMeshAnchor) {

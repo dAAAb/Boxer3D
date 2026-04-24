@@ -10,6 +10,8 @@ import Combine
 
 struct ContentView: View {
     @StateObject private var viewModel = ARViewModel()
+    @StateObject private var bridgeSettings = BridgeSettings.shared
+    @StateObject private var bridgeStreamer = SceneReportStreamer()
     /// 33 Hz tick — drives the MOT spring tween for every live track, and
     /// (when a detection is selected) also updates the off-screen arrow.
     private let uiTick = Timer.publish(every: 1.0 / 33.0, on: .main, in: .common).autoconnect()
@@ -109,6 +111,7 @@ struct ContentView: View {
                     .foregroundColor(.white.opacity(0.8))
                     .padding(.trailing, 12)
                 VStack(spacing: 10) {
+                    BridgeStatusButton(streamer: bridgeStreamer, settings: bridgeSettings)
                     FSDToggleButton(renderMode: viewModel.renderMode,
                                     action: { viewModel.toggleFsdMode() })
                     StreamToggleButton(streamMode: viewModel.streamMode,
@@ -146,6 +149,23 @@ struct ContentView: View {
                 viewModel.updateOffscreenHint()
             }
         }
+        .onAppear {
+            bridgeStreamer.sceneProvider = { [weak viewModel] in
+                viewModel?.bridgeSnapshot()
+            }
+            applyBridgeSettings()
+        }
+        .onChange(of: bridgeSettings.enabled) { _, _ in applyBridgeSettings() }
+        .onChange(of: bridgeSettings.urlString) { _, _ in applyBridgeSettings() }
+        .onChange(of: bridgeSettings.rateHz) { _, _ in applyBridgeSettings() }
+    }
+
+    private func applyBridgeSettings() {
+        guard bridgeSettings.enabled, let url = bridgeSettings.url else {
+            bridgeStreamer.stop()
+            return
+        }
+        bridgeStreamer.start(url: url, rateHz: bridgeSettings.rateHz)
     }
 }
 

@@ -1,6 +1,6 @@
 ---
 title: Boxer3D wiki — log
-updated: 2026-04-23
+updated: 2026-04-24
 ---
 
 # Log
@@ -11,6 +11,29 @@ Append-only. Newest on top. Format: `## [YYYY-MM-DD] <kind> | <title>`.
 Grep: `grep "^## \[" wiki/log.md | head -20`.
 
 ---
+
+## [2026-04-24] ship | SceneReport bridge (Step 2b+2c of Boxer3D→Gemini MVP)
+
+Added `boxer/bridge/` with a SwiftUI-visible WebSocket streamer that publishes
+`BridgeSceneReport` snapshots to a host at 1–30 Hz. Companion repo
+`Boxer3D-Bridge` (forked from the Google AI Studio Franka pick-and-place demo)
+hosts the relay server and the Vite/MuJoCo browser sim that consumes the
+stream. This is Step 2 of the plan captured in session memory
+`project_boxer3d_gemini_bridge.md`.
+
+Scope intentionally minimal: no AprilTag calibration yet (Step 2e). Until then
+ARKit world is mapped to MuJoCo world via a fixed axis swap in
+`BridgeCoord.arkitToMujoco`, arm base assumed at origin of whatever direction
+the iPhone was facing at ARKit session start. `yaw_rad` is 0 and
+`confidence` is derived from MOT `hits` count — real per-track confidence is
+not stored on `KnownDetection`.
+
+Touched: `boxer/bridge/BridgeTypes.swift` (new), `boxer/bridge/BridgeSettings.swift`
+(new), `boxer/bridge/SceneReportStreamer.swift` (new),
+`boxer/bridge/BridgeStatusButton.swift` (new), `boxer/ARViewModel.swift`
+(+`bridgeSnapshot()`), `boxer/ContentView.swift` (streamer @StateObject +
+toolbar button + settings bindings), `boxer.xcodeproj/project.pbxproj`
+(`INFOPLIST_KEY_NSLocalNetworkUsageDescription`).
 
 ## [2026-04-23] handoff | Seed LLM wiki per Karpathy pattern
 
