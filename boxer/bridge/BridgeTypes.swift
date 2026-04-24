@@ -36,14 +36,25 @@ struct BridgeSceneReport: Codable, Sendable {
 enum BridgeCoord {
     /// ARKit (right-handed, +Y up, +X right, +Z backward from camera) →
     /// MuJoCo (right-handed, +Z up, +X forward from arm, +Y left).
-    ///   mujocoX = -arkitZ   (forward from "rest pose")
+    ///
+    ///   mujocoX = -arkitZ
     ///   mujocoY = -arkitX
     ///   mujocoZ =  arkitY
-    /// Chosen so that objects sitting in front of the iPhone at session start
-    /// appear in front of the Franka base under identity calibration.
+    ///
+    /// Correct under the assumption that the iPhone was pointing at the
+    /// scene at session start. In practice ARKit picks +X / +Z from whatever
+    /// the camera happened to face when the app opened, so the user-facing
+    /// `worldYawDeg` setting (BridgeSettings) rotates the whole scene
+    /// around +Z to compensate.
     @inline(__always)
-    static func arkitToMujoco(_ p: simd_float3) -> simd_float3 {
-        simd_float3(-p.z, -p.x, p.y)
+    static func arkitToMujoco(_ p: simd_float3, yawDeg: Int = 0) -> simd_float3 {
+        let base = simd_float3(-p.z, -p.x, p.y)
+        switch ((yawDeg % 360) + 360) % 360 {
+        case 90:  return simd_float3(-base.y,  base.x, base.z)
+        case 180: return simd_float3(-base.x, -base.y, base.z)
+        case 270: return simd_float3( base.y, -base.x, base.z)
+        default:  return base
+        }
     }
 
     /// Derived confidence from MOT hits count (real per-track confidence is

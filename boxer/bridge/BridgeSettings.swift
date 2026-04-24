@@ -21,11 +21,20 @@ final class BridgeSettings: ObservableObject {
     @Published var rateHz: Double {
         didSet { UserDefaults.standard.set(rateHz, forKey: Keys.rateHz) }
     }
+    /// Extra yaw (around +Z) applied to every object position before sending.
+    /// Without AprilTag calibration (Step 2e), ARKit's world +X depends on
+    /// which direction the iPhone happens to face at session start — this
+    /// lets the user rotate the scene 0°/90°/180°/270° until sim matches
+    /// reality. Degrees, not radians.
+    @Published var worldYawDeg: Int {
+        didSet { UserDefaults.standard.set(worldYawDeg, forKey: Keys.yawDeg) }
+    }
 
     private enum Keys {
         static let enabled = "bridge.enabled"
         static let url = "bridge.url"
         static let rateHz = "bridge.rateHz"
+        static let yawDeg = "bridge.yawDeg"
     }
 
     private init() {
@@ -34,6 +43,8 @@ final class BridgeSettings: ObservableObject {
             ?? "ws://192.168.22.92:8787"
         let hz = UserDefaults.standard.double(forKey: Keys.rateHz)
         self.rateHz = hz > 0 ? hz : 10.0
+        let yaw = UserDefaults.standard.integer(forKey: Keys.yawDeg)
+        self.worldYawDeg = [0, 90, 180, 270].contains(yaw) ? yaw : 0
     }
 
     var url: URL? { URL(string: urlString) }

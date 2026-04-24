@@ -81,6 +81,13 @@ struct BridgeSettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: $settings.rateHz, in: 1...30, step: 1)
+                    Picker("World yaw", selection: $settings.worldYawDeg) {
+                        Text("0°").tag(0)
+                        Text("90°").tag(90)
+                        Text("180°").tag(180)
+                        Text("270°").tag(270)
+                    }
+                    .pickerStyle(.segmented)
                 }
                 Section("Status") {
                     LabeledContent("State", value: stateText)

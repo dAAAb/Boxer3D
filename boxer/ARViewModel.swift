@@ -868,8 +868,9 @@ final class ARViewModel: NSObject, ObservableObject {
             image_size: nil
         )
 
+        let yawDeg = BridgeSettings.shared.worldYawDeg
         let objects: [BridgeObject] = known.map { k in
-            let centerMj = BridgeCoord.arkitToMujoco(k.worldCenter)
+            let centerMj = BridgeCoord.arkitToMujoco(k.worldCenter, yawDeg: yawDeg)
             return BridgeObject(
                 id: k.id.uuidString,
                 label: k.label,

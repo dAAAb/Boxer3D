@@ -1,6 +1,6 @@
 ---
 title: Boxer3D wiki — log
-updated: 2026-04-24
+updated: 2026-04-25
 ---
 
 # Log
@@ -11,6 +11,40 @@ Append-only. Newest on top. Format: `## [YYYY-MM-DD] <kind> | <title>`.
 Grep: `grep "^## \[" wiki/log.md | head -20`.
 
 ---
+
+## [2026-04-25] ship | Bridge live tracking + direct pickup + UUID body naming
+
+Iterations on the Step 2d baseline to get real-world-to-sim tracking
+usable: cup moves in reality → cup moves in sim, two cups in the scene
+can be pickup-targeted individually.
+
+Three root causes surfaced and got fixed:
+
+1. BoxerNet MOT reaps silent tracks → the detections array shifts
+   indexes → body names keyed on index stopped matching. Switched to
+   `stream_{label}_{trackUUID}`; reorders now harmless.
+2. 10 Hz qpos teleport left 100 ms gaps where gravity visibly pulled
+   freejoint bodies. Moved the teleport inside the `mj_step` inner loop
+   so it runs at physics rate; paused during `sequenceAnimator.running`
+   so pickup animations can actually carry.
+3. `isIdleTimerDisabled = true` on `SceneReportStreamer.start()` — iOS
+   lock-screen was pausing ARKit after ~30 s and freezing tracks.
+
+Added `worldYawDeg` 0/90/180/270 picker in the Bridge settings sheet:
+ARKit's world +X depends on whatever direction the iPhone faces at
+session start, so without AprilTag calibration the scene can land
+rotated. User flips to the matching option once per session.
+
+Swift side also refined the ARKit→MuJoCo swap math (verified
+right-handedness preserved under each yaw rotation) and honours the
+yaw offset via `BridgeCoord.arkitToMujoco(p, yawDeg:)`.
+
+Touched: `boxer/bridge/SceneReportStreamer.swift` (idle timer, text
+frame — `.string` not `.data`), `boxer/bridge/BridgeTypes.swift`
+(yawDeg parameter, still right-handed at every rotation),
+`boxer/bridge/BridgeSettings.swift` + `BridgeStatusButton.swift` (yaw
+picker), `boxer/ARViewModel.swift` (`bridgeSnapshot` passes track UUID
+instead of array index, reads yawDeg from settings).
 
 ## [2026-04-24] ship | Bridge end-to-end verified on real iPhone (Step 2d)
 

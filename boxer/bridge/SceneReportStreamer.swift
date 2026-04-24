@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UIKit
 
 /// Publishes `BridgeSceneReport` messages to a host WebSocket at a fixed rate.
 ///
@@ -37,6 +38,10 @@ final class SceneReportStreamer: ObservableObject {
     func start(url: URL, rateHz: Double) {
         stopInternal()
         state = .connecting
+        // Prevent the screen from sleeping while streaming — otherwise
+        // ARKit pauses after ~30 s of inactivity, knownDetections freeze,
+        // and the sim-side live tracking stops reflecting real motion.
+        UIApplication.shared.isIdleTimerDisabled = true
 
         let t = session.webSocketTask(with: url)
         self.task = t
@@ -59,6 +64,7 @@ final class SceneReportStreamer: ObservableObject {
     func stop() {
         stopInternal()
         state = .idle
+        UIApplication.shared.isIdleTimerDisabled = false
     }
 
     private func stopInternal() {
