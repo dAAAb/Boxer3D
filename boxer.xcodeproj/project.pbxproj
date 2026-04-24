@@ -270,6 +270,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Boxer3D;
+				INFOPLIST_FILE = Info.plist;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Boxer3D needs camera access for AR 3D object detection.";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Boxer3D streams detected objects to a local host for robot control.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -304,6 +305,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Boxer3D;
+				INFOPLIST_FILE = Info.plist;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Boxer3D needs camera access for AR 3D object detection.";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Boxer3D streams detected objects to a local host for robot control.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;

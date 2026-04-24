@@ -88,7 +88,10 @@ final class SceneReportStreamer: ObservableObject {
         guard let task, let report = sceneProvider?() else { return }
         do {
             let data = try encoder.encode(report)
-            task.send(.data(data)) { [weak self] error in
+            // Send as .string (text frame) so browsers receive `ev.data`
+            // as a String and JSON.parse works without Blob handling.
+            let json = String(data: data, encoding: .utf8) ?? ""
+            task.send(.string(json)) { [weak self] error in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     if let error {

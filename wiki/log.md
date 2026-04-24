@@ -12,6 +12,33 @@ Grep: `grep "^## \[" wiki/log.md | head -20`.
 
 ---
 
+## [2026-04-24] ship | Bridge end-to-end verified on real iPhone (Step 2d)
+
+Text-frame fix: `task.send(.string(...))` instead of `.data(...)`. Browser
+`JSON.parse` needs a string; binary frames arrived as Blob and silently
+failed the try/catch, leaving `client.latest = null` so the toolbar Radio
+button stayed disabled even though the WS itself was connected.
+
+Second landmine: ATS. `NSAllowsLocalNetworking = YES` is **required** for
+cleartext `ws://` to private LAN IPs under URLSession (Safari is exempt, but
+in-app sessions are not). Complex plist keys can't be set via
+`INFOPLIST_KEY_*` — the string-form `"{... = YES;}"` silently drops. Fix:
+add a real `Info.plist` at project root (outside the
+`PBXFileSystemSynchronizedRootGroup` — any file named `Info.plist` inside
+`boxer/` collides with the auto-generated bundle plist) and set
+`INFOPLIST_FILE = Info.plist`. With `GENERATE_INFOPLIST_FILE = YES` still
+on, the two plists merge cleanly.
+
+Verified: 4 objects detected on iPhone (cup / bottle / laptop / person
+inferred from user's own hand) appear in the Vite sim as coloured boxes
+at positions consistent with their real-world positions relative to the
+ARKit session origin. Sizes correct (37×26×21 cm laptop reads the same
+in sim).
+
+Touched: `boxer/bridge/SceneReportStreamer.swift` (.string frame),
+`Boxer3D-Bridge/SceneReportClient.ts` (Blob/ArrayBuffer fallback),
+`Info.plist` (new), `boxer.xcodeproj/project.pbxproj` (INFOPLIST_FILE).
+
 ## [2026-04-24] ship | SceneReport bridge (Step 2b+2c of Boxer3D→Gemini MVP)
 
 Added `boxer/bridge/` with a SwiftUI-visible WebSocket streamer that publishes
