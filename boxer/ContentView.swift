@@ -179,7 +179,7 @@ struct DetectionCard: View {
             Circle()
                 .fill(color)
                 .frame(width: 10, height: 10)
-            Text("\(detection.label) #\(detection.instanceIndex)")
+            Text("\(detection.label) #\(detection.shortId)")
                 .font(.system(size: 13, weight: .bold))
                 .foregroundColor(.white)
             Text(String(format: "%.0fx%.0fx%.0f",

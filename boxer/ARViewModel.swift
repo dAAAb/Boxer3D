@@ -7,11 +7,30 @@ import simd
 import UIKit
 
 struct DetectionInfo: Identifiable {
-    let id = UUID()
+    let id: UUID
     let label: String
     let instanceIndex: Int
     let size: simd_float3
     let confidence: Float
+
+    init(id: UUID = UUID(), label: String, instanceIndex: Int, size: simd_float3, confidence: Float) {
+        self.id = id
+        self.label = label
+        self.instanceIndex = instanceIndex
+        self.size = size
+        self.confidence = confidence
+    }
+
+    /// First 4 alphanumeric chars of the track UUID, uppercased. Identical
+    /// algorithm to the browser-side label sprite, so an object reads the
+    /// same on both screens — `cup #1A2B` on the iPhone is the same object
+    /// as `cup #1A2B` in the sim. Stable across frames; changes only when
+    /// BoxerNet's MOT reaps and respawns the track (then both screens show
+    /// the new id together).
+    var shortId: String {
+        let alnum = id.uuidString.filter { $0.isLetter || $0.isNumber }
+        return String(alnum.prefix(4)).uppercased()
+    }
 }
 
 private struct KnownDetection {
@@ -619,7 +638,13 @@ final class ARViewModel: NSObject, ObservableObject {
 
             let nextIdx = (instanceCountByLabel[label] ?? 0) + 1
             instanceCountByLabel[label] = nextIdx
-            let tag = "\(label) #\(nextIdx)"
+            // Allocate the track UUID up-front so the on-screen tag (here)
+            // and the bridge / sim sprite (computed from the same UUID
+            // browser-side) read the same shortId.
+            let trackId = UUID()
+            let info = DetectionInfo(id: trackId, label: label, instanceIndex: nextIdx,
+                                     size: det.size, confidence: det.confidence)
+            let tag = "\(label) #\(info.shortId)"
             addedTags.append(tag)
 
             // Anchor node: empty, carries the detection's world transform. The
@@ -656,10 +681,8 @@ final class ARViewModel: NSObject, ObservableObject {
 
             sceneView.scene.rootNode.addChildNode(node)
 
-            let info = DetectionInfo(label: label, instanceIndex: nextIdx,
-                                     size: det.size, confidence: det.confidence)
             known.append(KnownDetection(
-                id: info.id, label: label, instanceIndex: nextIdx,
+                id: trackId, label: label, instanceIndex: nextIdx,
                 worldCenter: center, size: det.size,
                 node: node, wireframeNode: wireframeNode,
                 shadowNode: shadowNode,
