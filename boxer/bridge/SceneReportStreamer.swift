@@ -31,7 +31,11 @@ final class SceneReportStreamer: ObservableObject {
         return e
     }()
 
-    var sceneProvider: (() -> BridgeSceneReport?)?
+    /// Closure that builds a fresh BridgeSceneReport on demand. The flag
+    /// is forwarded to ARViewModel.bridgeSnapshot — false on the regular
+    /// 10 Hz tick (no image for bandwidth), true when the browser sent a
+    /// `request_frame` control message.
+    var sceneProvider: ((_ includeImage: Bool) -> BridgeSceneReport?)?
 
     /// Opens the WebSocket and starts the publish timer. Cancels any prior
     /// connection first. Safe to call repeatedly (e.g. on URL change).
@@ -81,7 +85,8 @@ final class SceneReportStreamer: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self, self.task === t else { return }
                 switch result {
-                case .success:
+                case .success(let message):
+                    self.handleIncoming(message)
                     self.receiveLoop(for: t)
                 case .failure(let err):
                     self.handleError(err)
@@ -90,8 +95,42 @@ final class SceneReportStreamer: ObservableObject {
         }
     }
 
+    /// Parse incoming WS messages for control commands. Currently only
+    /// `{"type":"request_frame"}` is handled — the browser sends this when
+    /// it wants a fresh JPEG keyframe to feed Gemini-ER.
+    private func handleIncoming(_ msg: URLSessionWebSocketTask.Message) {
+        let text: String?
+        switch msg {
+        case .string(let s): text = s
+        case .data(let d): text = String(data: d, encoding: .utf8)
+        @unknown default: text = nil
+        }
+        guard let text,
+              let data = text.data(using: .utf8),
+              let envelope = try? JSONDecoder().decode([String: String].self, from: data),
+              envelope["type"] == "request_frame" else { return }
+        sendFrameResponse()
+    }
+
+    /// One-shot send of a SceneReport with `image` populated. Bypasses the
+    /// regular tick cadence — keeps Detect latency low.
+    private func sendFrameResponse() {
+        guard let task, let report = sceneProvider?(true) else { return }
+        do {
+            let data = try encoder.encode(report)
+            let json = String(data: data, encoding: .utf8) ?? ""
+            task.send(.string(json)) { [weak self] error in
+                Task { @MainActor [weak self] in
+                    if let error { self?.handleError(error) }
+                }
+            }
+        } catch {
+            handleError(error)
+        }
+    }
+
     private func tick() {
-        guard let task, let report = sceneProvider?() else { return }
+        guard let task, let report = sceneProvider?(false) else { return }
         do {
             let data = try encoder.encode(report)
             // Send as .string (text frame) so browsers receive `ev.data`

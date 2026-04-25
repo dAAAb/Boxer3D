@@ -1,8 +1,10 @@
 import Foundation
 import ARKit
 import Combine
+import CoreImage
 import SceneKit
 import simd
+import UIKit
 
 struct DetectionInfo: Identifiable {
     let id = UUID()
@@ -859,13 +861,24 @@ final class ARViewModel: NSObject, ObservableObject {
     /// doesn't separate object-local from world-aligned extents. Yaw is
     /// currently zeroed for the same reason — recovering a faithful yaw from
     /// `targetTransform` under the ARKit→MuJoCo swap is TODO for Step 2e.
-    func bridgeSnapshot() -> BridgeSceneReport? {
+    func bridgeSnapshot(includeImage: Bool = false) -> BridgeSceneReport? {
         guard let frame = sceneView?.session.currentFrame else { return nil }
 
         let cam = frame.camera.transform
+        let nativeRes = frame.camera.imageResolution
         let poseMujoco = BridgeCamera(
             pose_world: Self.serializeTransform(cam),
-            image_size: nil
+            image_size: [Int(nativeRes.width), Int(nativeRes.height)]
+        )
+
+        // Pinhole intrinsics for the NATIVE camera image (the unrotated
+        // capturedImage CVPixelBuffer). The browser uses these to project
+        // 3D OBB centres into the same image Gemini sees, so 2D detections
+        // can be matched to track UUIDs by closest-pixel distance.
+        let intr = frame.camera.intrinsics
+        let intrinsics = BridgeCameraIntrinsics(
+            fxfycxcy: [intr[0, 0], intr[1, 1], intr[2, 0], intr[2, 1]],
+            image_size_native: [Int(nativeRes.width), Int(nativeRes.height)]
         )
 
         let yawDeg = BridgeSettings.shared.worldYawDeg
@@ -881,12 +894,16 @@ final class ARViewModel: NSObject, ObservableObject {
             )
         }
 
+        let image: BridgeImage? = includeImage ? Self.captureFrameJPEG(from: frame) : nil
+
         return BridgeSceneReport(
             version: 1,
             coordinate_frame: "mujoco_world",
             timestamp: Date().timeIntervalSince1970,
             camera: poseMujoco,
-            objects: objects
+            objects: objects,
+            camera_intrinsics: intrinsics,
+            image: image
         )
     }
 
@@ -897,6 +914,32 @@ final class ARViewModel: NSObject, ObservableObject {
             m.columns.2.x, m.columns.2.y, m.columns.2.z, m.columns.2.w,
             m.columns.3.x, m.columns.3.y, m.columns.3.z, m.columns.3.w,
         ]
+    }
+
+    /// Encode the current ARFrame's camera image as a base64 JPEG, downscaled
+    /// so its longer side is at most ~640 px. Lossy q=0.6 gives ~30–80 KB —
+    /// plenty for Gemini-ER 1.6 spatial reasoning, tiny on a LAN WebSocket.
+    /// Runs on whichever queue called bridgeSnapshot (typically MainActor);
+    /// JPEG encoding is hardware-accelerated, ~10 ms.
+    private static func captureFrameJPEG(from frame: ARFrame, maxDim: CGFloat = 640, quality: CGFloat = 0.6) -> BridgeImage? {
+        let pixelBuffer = frame.capturedImage
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let nativeW = ciImage.extent.width
+        let nativeH = ciImage.extent.height
+        let scale = min(maxDim / nativeW, maxDim / nativeH, 1.0)
+        let scaled: CIImage = scale < 1
+            ? ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            : ciImage
+        let context = CIContext(options: [.useSoftwareRenderer: false])
+        guard let cgImage = context.createCGImage(scaled, from: scaled.extent) else { return nil }
+        let uiImage = UIImage(cgImage: cgImage)
+        guard let jpegData = uiImage.jpegData(compressionQuality: quality) else { return nil }
+        return BridgeImage(
+            base64: jpegData.base64EncodedString(),
+            mime: "image/jpeg",
+            width: Int(scaled.extent.width),
+            height: Int(scaled.extent.height)
+        )
     }
 
     // MARK: - Scene Reconstruction (FSD mode mesh)

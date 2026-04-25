@@ -150,8 +150,8 @@ struct ContentView: View {
             }
         }
         .onAppear {
-            bridgeStreamer.sceneProvider = { [weak viewModel] in
-                viewModel?.bridgeSnapshot()
+            bridgeStreamer.sceneProvider = { [weak viewModel] include in
+                viewModel?.bridgeSnapshot(includeImage: include)
             }
             applyBridgeSettings()
         }
