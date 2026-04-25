@@ -52,6 +52,11 @@ struct BridgeSceneReport: Codable, Sendable {
     let objects: [BridgeObject]
     let camera_intrinsics: BridgeCameraIntrinsics?
     let image: BridgeImage?
+    /// The yaw picker value applied to objects[].center_world. Browser
+    /// uses this to invert the swap when projecting OBBs into the iPhone
+    /// image (camera.pose_world stays in ARKit frame; objects are in
+    /// MuJoCo frame post-arkitToMujoco swap).
+    let world_yaw_deg: Int?
 }
 
 enum BridgeCoord {

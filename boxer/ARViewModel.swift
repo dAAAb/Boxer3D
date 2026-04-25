@@ -903,7 +903,8 @@ final class ARViewModel: NSObject, ObservableObject {
             camera: poseMujoco,
             objects: objects,
             camera_intrinsics: intrinsics,
-            image: image
+            image: image,
+            world_yaw_deg: yawDeg
         )
     }
 
