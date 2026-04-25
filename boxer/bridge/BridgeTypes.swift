@@ -25,12 +25,33 @@ struct BridgeCamera: Codable, Sendable {
     let image_size: [Int]?
 }
 
+/// Pinhole intrinsics for the NATIVE camera image (the one ARFrame ships
+/// before any downscale). The browser uses these to project 3D OBB
+/// centres into the same image Gemini saw, then matches Gemini's 2D
+/// detections to track UUIDs by 2D pixel distance.
+struct BridgeCameraIntrinsics: Codable, Sendable {
+    let fxfycxcy: [Float]
+    let image_size_native: [Int]
+}
+
+/// Optional image payload — only attached when the browser sent a
+/// `request_frame` control message. JPEG, base64-encoded (Vite does not
+/// need a `data:` URI prefix).
+struct BridgeImage: Codable, Sendable {
+    let base64: String
+    let mime: String
+    let width: Int
+    let height: Int
+}
+
 struct BridgeSceneReport: Codable, Sendable {
     let version: Int
     let coordinate_frame: String
     let timestamp: Double
     let camera: BridgeCamera?
     let objects: [BridgeObject]
+    let camera_intrinsics: BridgeCameraIntrinsics?
+    let image: BridgeImage?
 }
 
 enum BridgeCoord {
