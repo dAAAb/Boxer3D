@@ -32,7 +32,7 @@ torch.nn.functional.scaled_dot_product_attention = _sdpa_math
 
 
 class BoxerNetTensorOnly(nn.Module):
-    def __init__(self, boxer):
+    def __init__(self, boxer, image_size: int = 480):
         super().__init__()
         self.dino = boxer.dino
         self.input2emb = boxer.input2emb
@@ -48,12 +48,14 @@ class BoxerNetTensorOnly(nn.Module):
         self.min_dim = float(boxer.head.min_dim)
         self.yaw_max = float(np.pi / 2)
 
-        # Static shapes — 480 input, 16-px patches → 30×30 = 900 tokens.
-        # DINOv3 RoPE is computed per-forward from H, W so arbitrary multiples
-        # of the patch size work without architectural changes; accuracy may
-        # drift vs. the 960-trained checkpoint until fine-tuned.
-        self.fH = 30
-        self.fW = 30
+        # Static shapes derived from image_size + 16-px patch. DINOv3 RoPE is
+        # computed per-forward from H, W so arbitrary multiples of the patch
+        # size work without architectural changes; accuracy may drift vs. the
+        # 960-trained checkpoint until fine-tuned.
+        if image_size % 16 != 0:
+            raise ValueError(f"image_size must be divisible by 16; got {image_size}")
+        self.fH = image_size // 16
+        self.fW = image_size // 16
         self.num_patches = self.fH * self.fW
 
     def forward(self, img, sdp_median, ray_enc, bb2d_norm):

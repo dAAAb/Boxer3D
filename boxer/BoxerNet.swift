@@ -52,10 +52,14 @@ struct Box2D {
 final class BoxerNet: @unchecked Sendable {
     private let model: MLModel
 
-    /// Image size the model expects. Halved from 960 to 480 (Boxer3D Flash Lv 2)
-    /// — 4-6× speedup since DINOv3 self-attn is O(N²) in token count.
-    /// Accuracy may drift vs. the 960-trained checkpoint until fine-tuned.
-    static let imageSize: Int = 480
+    /// Image size the model expects. 720 was chosen as a compromise between
+    /// the original 960-trained checkpoint (best accuracy, slowest) and the
+    /// 480 Flash Lv 2 build (fastest, but visually-similar classes like
+    /// cup-shaped mug vs Coca-Cola can collapse into one MOT track because
+    /// per-frame classification flickers under reduced feature resolution).
+    /// 720 → 45×45=2025 tokens vs 480's 900 tokens (~2.25× attention cost,
+    /// still ~half the cost of 960's 3600 tokens).
+    static let imageSize: Int = 720
     /// Patch size used by DINOv3.
     static let patchSize: Int = 16
     /// Feature grid dimensions.

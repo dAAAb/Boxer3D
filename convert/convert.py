@@ -43,7 +43,17 @@ def main():
         help="ANE often OOMs on 200MB+ models; cpuAndGPU is the safe default.",
     )
     ap.add_argument("--skip-save", action="store_true", help="stop before saving (for debugging)")
+    ap.add_argument(
+        "--image-size",
+        type=int,
+        default=480,
+        help="Square input edge length in pixels. Must be divisible by 16 (DINOv3 patch).",
+    )
     args = ap.parse_args()
+    if args.image_size % 16 != 0:
+        sys.exit(f"--image-size must be divisible by 16; got {args.image_size}")
+    grid = args.image_size // 16
+    n_tokens = grid * grid
 
     ckpt_dir = Path(args.ckpt_dir)
     boxer_ckpt = ckpt_dir / "boxernet_hw960in4x6d768-wssxpf9p.ckpt"
@@ -61,12 +71,12 @@ def main():
     boxer = BoxerNet.load_from_checkpoint(str(boxer_ckpt), device="cpu")
     boxer.eval()
 
-    wrapper = BoxerNetTensorOnly(boxer).eval()
+    wrapper = BoxerNetTensorOnly(boxer, image_size=args.image_size).eval()
 
-    print("[2/5] Sanity-checking wrapper forward")
-    img = torch.rand(1, 3, 480, 480)
-    sdp = torch.rand(1, 1, 30, 30)
-    ray = torch.rand(1, 900, 6)
+    print(f"[2/5] Sanity-checking wrapper forward at {args.image_size}x{args.image_size} ({n_tokens} tokens)")
+    img = torch.rand(1, 3, args.image_size, args.image_size)
+    sdp = torch.rand(1, 1, grid, grid)
+    ray = torch.rand(1, n_tokens, 6)
     bb2d = torch.tensor(
         [[[0.1, 0.5, 0.1, 0.5], [0.2, 0.6, 0.2, 0.6], [0.3, 0.7, 0.3, 0.7]]]
     )

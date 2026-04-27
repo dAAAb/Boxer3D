@@ -704,8 +704,16 @@ final class ARViewModel: NSObject, ObservableObject {
 
     /// Score a candidate (new-detection, existing-track) pair. Returns nil if
     /// the pair isn't a plausible match at all; lower score means better.
-    /// See plan: same-label gate = max(0.25 m, 0.75 × maxDim), volRatio ≥ 0.35.
-    /// Cross-label soft-merge: dist < 0.5 × maxDim AND volRatio ≥ 0.5.
+    ///
+    /// Same-label gate tightened from 0.75 → 0.4 × maxDim and volRatio ≥ 0.6
+    /// (from 0.35) to fix Mickey-mug ↔ Coca-Cola-can ID switching observed
+    /// 2026-04-27. Earlier wider gate (25 cm absolute floor on max(0.25,
+    /// 0.75 × maxDim)) was associating two genuinely-different cup-shaped
+    /// objects under the same track when BoxerNet at 480-px input
+    /// momentarily mis-classified the can as "cup". Tighter gate + stricter
+    /// vol ratio means a same-label match now needs the new detection both
+    /// near the existing track AND of similar size.
+    /// Cross-label soft-merge unchanged (already tight at 0.5 × maxDim).
     private func matchScore(label: String, center: simd_float3, size: simd_float3,
                             against k: KnownDetection) -> Float? {
         let newMaxDim = max(size.x, max(size.y, size.z))
@@ -714,10 +722,10 @@ final class ARViewModel: NSObject, ObservableObject {
         let newVol = size.x * size.y * size.z
         let kVol = k.size.x * k.size.y * k.size.z
         let volRatio = min(newVol, kVol) / max(newVol, kVol)
-        let gate = max(Float(0.25), 0.75 * max(newMaxDim, kMaxDim))
+        let gate = max(Float(0.12), 0.4 * max(newMaxDim, kMaxDim))
 
         if k.label == label {
-            guard dist < gate, volRatio >= 0.35 else { return nil }
+            guard dist < gate, volRatio >= 0.6 else { return nil }
             return dist / gate + 0.5 * (1 - volRatio)
         } else {
             // Soft cross-class merge — catches cup/bottle YOLO flips.
