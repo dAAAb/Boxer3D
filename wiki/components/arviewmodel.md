@@ -53,6 +53,7 @@ struct KnownDetection {
 Concepts this touches:
 [spring-tween](../concepts/spring-tween.md),
 [track-hysteresis](../concepts/track-hysteresis.md),
+[mot-graveyard](../concepts/mot-graveyard.md),
 [contact-shadow](../concepts/contact-shadow.md).
 
 ## Main flows
@@ -74,10 +75,13 @@ detail: YOLO boxes that project into an existing confirmed track's
 
 ### `placeBoxes(_:in:)` (MainActor)
 Greedy nearest-centroid matching (label-gated) between new detections and
-existing tracks. Unmatched detections become new tracks; they get a
-wireframe, an optional USDZ ghost mesh from [`MeshLibrary`](meshlibrary.md),
-and a contact-shadow decal. Palette is applied on creation so new boxes
-match the current render mode — crucial for stable FSD mode visuals (see
+existing tracks. Unmatched detections first probe the
+[mot-graveyard](../concepts/mot-graveyard.md) via `tryResurrect` to
+recover a recently-dead UUID; only on a graveyard miss do they become
+brand-new tracks. New tracks get a wireframe, an optional USDZ ghost
+mesh from [`MeshLibrary`](meshlibrary.md), and a contact-shadow decal.
+Palette is applied on creation so new boxes match the current render
+mode — crucial for stable FSD mode visuals (see
 [fsd-palette.md](../concepts/fsd-palette.md)).
 
 ### `tickTracks()` (called 33 Hz from ContentView)

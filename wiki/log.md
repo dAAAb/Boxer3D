@@ -1,6 +1,6 @@
 ---
 title: Boxer3D wiki — log
-updated: 2026-04-25
+updated: 2026-04-28
 ---
 
 # Log
@@ -11,6 +11,32 @@ Append-only. Newest on top. Format: `## [YYYY-MM-DD] <kind> | <title>`.
 Grep: `grep "^## \[" wiki/log.md | head -20`.
 
 ---
+
+## [2026-04-28] ship | Step 3.14 — MOT tracklet graveyard (UUID stitching)
+
+Fixed cup-blinks-and-gets-renamed every few seconds even with phone +
+cup both still. Two complementary changes in `boxer/ARViewModel.swift`:
+
+1. Dropped `where !k.reaping` filter from the matching loop. The
+   `updateTrack` revival path (cancel fadeOut, opacity → 1,
+   `reaping = false`) was already there but unreachable; reaping
+   tracks now compete for matches and revive in the 0.3 s fade window.
+2. Added `graveyard: [GraveyardEntry]` parallel to `known`. On
+   `finalReap`, the dying track's UUID + label + size + last
+   centre/velocity is stashed for `graveyardTTL = 2 s`. New unclaimed
+   detections call `tryResurrect` first; geometric match (label,
+   distance with velocity extrapolation, vol-ratio ≥ 0.7) revives the
+   old UUID instead of allocating a new one. `cleanGraveyard` ages
+   entries via `tickTracks`.
+
+Resurrection thresholds intentionally stricter than live `matchScore`
+on shape (vol-ratio 0.7 vs 0.6) and looser on distance (gate 0.5 ×
+maxDim, 0.15 m floor vs 0.4 × maxDim / 0.12 m). False resurrection
+silently corrupts identity; missed resurrection only costs a visible
+UUID rotation, so we'd rather miss than alias.
+
+Touched: `boxer/ARViewModel.swift`, `wiki/concepts/mot-graveyard.md` (new),
+`wiki/components/ARViewModel.md` (cross-link).
 
 ## [2026-04-25] ship | Bridge live tracking + direct pickup + UUID body naming
 

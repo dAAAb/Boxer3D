@@ -31,3 +31,8 @@ boxer/*.onnx.metadata
 wiki/.obsidian/workspace.json
 wiki/.obsidian/workspace-mobile.json
 wiki/.obsidian/cache
+
+# Old / backup model snapshots — kept locally for rollback, never committed
+# and never inside boxer/ (Xcode 16's PBXFileSystemSynchronizedRootGroup
+# would auto-include them and cause duplicate-class compile errors).
+archive/

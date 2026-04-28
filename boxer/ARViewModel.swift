@@ -60,6 +60,24 @@ private struct KnownDetection {
     var reaping: Bool = false
 }
 
+/// Recently-died track snapshot. Held for `graveyardTTL` seconds so a
+/// re-detection at the same spot can resurrect the UUID instead of
+/// allocating a fresh one — the fix for the cup-blinks-and-gets-renamed
+/// failure mode that breaks downstream UUID-keyed consumers (Bridge,
+/// Gemini plans, expect_holding). The structure parallels MOT
+/// "tracklet stitching" / "object permanence" patterns from ByteTrack
+/// and Tesla FSD: dead tracks are not actually freed, they wait in a
+/// short-lived buffer for a re-detection that geometrically lines up.
+private struct GraveyardEntry {
+    let id: UUID
+    let label: String
+    let instanceIndex: Int
+    let size: simd_float3
+    let lastWorldCenter: simd_float3
+    let lastVelocity: simd_float3
+    let timeOfDeath: CFTimeInterval
+}
+
 /// Screen-space guidance for an off-screen selected object.
 struct OffscreenHint {
     /// Angle in radians from screen centre to the clamped arrow position.
@@ -107,6 +125,15 @@ final class ARViewModel: NSObject, ObservableObject {
     private var yoloDetector: YOLODetector?
     private let meshLibrary = MeshLibrary()
     private var known: [KnownDetection] = []
+    /// Recently-reaped tracks awaiting possible resurrection by a near-by
+    /// re-detection. See `tryResurrect` and `cleanGraveyard`.
+    private var graveyard: [GraveyardEntry] = []
+    /// Window during which a re-detection at the same spot can revive a
+    /// dead track's UUID. 2 s covers typical handheld jitter / brief
+    /// occlusions; longer than this and the spot may legitimately be a
+    /// different object. Tesla AI day talks reference 1–3 s for short-
+    /// occlusion stitching.
+    private static let graveyardTTL: CFTimeInterval = 2.0
     private var cycleStart: Date?
     private var lastAddedClearTask: Task<Void, Never>?
     /// Running count of detections per class, used to number instances
@@ -424,6 +451,7 @@ final class ARViewModel: NSObject, ObservableObject {
             }
         }
         reapStaleTracks(now: now)
+        cleanGraveyard(now: now)
     }
 
     private func reapStaleTracks(now: CFTimeInterval) {
@@ -446,12 +474,37 @@ final class ARViewModel: NSObject, ObservableObject {
 
     private func finalReap(id: UUID, node: SCNNode) {
         node.removeFromParentNode()
+        // Snapshot last-known state into the graveyard before deletion.
+        // A re-detection within `graveyardTTL` at a similar spot can
+        // resurrect this UUID via tryResurrect() instead of forcing a
+        // fresh allocation that downstream consumers would treat as a
+        // brand-new object.
+        if let dying = known.first(where: { $0.id == id }) {
+            graveyard.append(GraveyardEntry(
+                id: dying.id,
+                label: dying.label,
+                instanceIndex: dying.instanceIndex,
+                size: dying.size,
+                lastWorldCenter: dying.worldCenter,
+                lastVelocity: dying.velocity,
+                timeOfDeath: CACurrentMediaTime()
+            ))
+        }
         known.removeAll { $0.id == id }
         detections.removeAll { $0.id == id }
         if selectedId == id {
             selectedId = nil
             offscreenHint = nil
         }
+    }
+
+    /// Drop graveyard entries older than `graveyardTTL`. Called from
+    /// `tickTracks` so the graveyard size is bounded and stale UUIDs
+    /// can't accidentally resurrect after a long absence (which would
+    /// be silent identity confusion — much worse than a visible
+    /// new-UUID rotation).
+    private func cleanGraveyard(now: CFTimeInterval) {
+        graveyard.removeAll { now - $0.timeOfDeath > Self.graveyardTTL }
     }
 
     func toggleStream() {
@@ -614,7 +667,13 @@ final class ARViewModel: NSObject, ObservableObject {
         for (d, det) in detections.enumerated() {
             let newCenter = simd_make_float3(det.worldTransform.columns.3)
             let label = det.label ?? "object"
-            for (t, k) in known.enumerated() where !k.reaping {
+            // Include reaping tracks: updateTrack() at the bottom of this
+            // file has dedicated revival logic (cancel fadeOut, opacity
+            // back to 1, reaping = false) that could never run before
+            // because the matching loop filtered reaping tracks out.
+            // Letting them compete fixes the most common single-frame
+            // miss → instant new UUID failure.
+            for (t, k) in known.enumerated() {
                 if let s = matchScore(label: label, center: newCenter, size: det.size,
                                       against: k) {
                     pairs.append(Pair(d: d, t: t, score: s))
@@ -630,18 +689,39 @@ final class ARViewModel: NSObject, ObservableObject {
             claimedDet.insert(p.d); claimedTrack.insert(p.t)
         }
 
-        // 2. Unclaimed detections → new tracks (existing creation path).
+        // 2. Unclaimed detections → graveyard resurrection or new tracks.
         var addedTags: [String] = []
         for (d, det) in detections.enumerated() where !claimedDet.contains(d) {
             let label = det.label ?? "object"
             let center = simd_make_float3(det.worldTransform.columns.3)
 
-            let nextIdx = (instanceCountByLabel[label] ?? 0) + 1
-            instanceCountByLabel[label] = nextIdx
-            // Allocate the track UUID up-front so the on-screen tag (here)
-            // and the bridge / sim sprite (computed from the same UUID
-            // browser-side) read the same shortId.
-            let trackId = UUID()
+            // Step 3.14: try the graveyard first. A geometry-matching dead
+            // track within `graveyardTTL` resurrects with its old UUID,
+            // preserving identity for downstream consumers (Bridge,
+            // Gemini plans, expect_holding) across brief occlusions.
+            let resurrected = tryResurrect(label: label, center: center,
+                                           size: det.size, now: now)
+            let trackId: UUID
+            let nextIdx: Int
+            let initialHits: Int
+            if let (gIdx, entry) = resurrected {
+                trackId = entry.id
+                nextIdx = entry.instanceIndex
+                // Resurrected tracks were already confirmed once. Start
+                // hits at 2 so they get the long (20 s) reap timeout
+                // immediately, not the 8 s provisional grace.
+                initialHits = 2
+                graveyard.remove(at: gIdx)
+            } else {
+                let next = (instanceCountByLabel[label] ?? 0) + 1
+                instanceCountByLabel[label] = next
+                // Allocate the track UUID up-front so the on-screen tag
+                // (here) and the bridge / sim sprite (computed from the
+                // same UUID browser-side) read the same shortId.
+                trackId = UUID()
+                nextIdx = next
+                initialHits = 1
+            }
             let info = DetectionInfo(id: trackId, label: label, instanceIndex: nextIdx,
                                      size: det.size, confidence: det.confidence)
             let tag = "\(label) #\(info.shortId)"
@@ -687,7 +767,8 @@ final class ARViewModel: NSObject, ObservableObject {
                 node: node, wireframeNode: wireframeNode,
                 shadowNode: shadowNode,
                 targetTransform: det.worldTransform,
-                velocity: .zero, lastSeen: now, reaping: false
+                velocity: .zero, lastSeen: now,
+                hits: initialHits, reaping: false
             ))
             self.detections.append(info)
 
@@ -732,6 +813,45 @@ final class ARViewModel: NSObject, ObservableObject {
             guard dist < 0.5 * max(newMaxDim, kMaxDim), volRatio >= 0.5 else { return nil }
             return dist / gate + 0.5 * (1 - volRatio) + 0.3  // small cross-class penalty
         }
+    }
+
+    /// Attempt to resurrect a dead-track UUID for an unclaimed detection.
+    /// Returns the graveyard index (so caller can remove it) and the
+    /// entry, or nil if no plausible candidate.
+    ///
+    /// Stricter than live matching: cross-label resurrection is **disabled**
+    /// (a laptop should never inherit a cup's UUID), volume-ratio floor
+    /// is 0.7 (vs 0.6 live), gate widens slightly to 0.5 × maxDim with a
+    /// 0.15 m floor (vs live 0.4 × maxDim, 0.12 m). Looser distance
+    /// because the death itself signals matcher noise; tighter shape
+    /// because a wrong resurrection silently corrupts identity, while a
+    /// wrong rejection just costs a visible UUID rotation.
+    private func tryResurrect(label: String, center: simd_float3, size: simd_float3,
+                              now: CFTimeInterval) -> (Int, GraveyardEntry)? {
+        let newMaxDim = max(size.x, max(size.y, size.z))
+        let newVol = size.x * size.y * size.z
+        var best: (idx: Int, score: Float, entry: GraveyardEntry)? = nil
+        for (i, g) in graveyard.enumerated() {
+            guard g.label == label else { continue }
+            let dt = Float(now - g.timeOfDeath)
+            // Tesla "object permanence" — extrapolate the predicted
+            // position by integrating last-known velocity over the
+            // gap. For a static object this collapses to lastWorldCenter.
+            let predicted = g.lastWorldCenter + g.lastVelocity * dt
+            let gMaxDim = max(g.size.x, max(g.size.y, g.size.z))
+            let gate = max(Float(0.15), 0.5 * max(newMaxDim, gMaxDim))
+            let dist = simd_distance(predicted, center)
+            let gVol = g.size.x * g.size.y * g.size.z
+            let volRatio = min(newVol, gVol) / max(newVol, gVol)
+            guard dist < gate, volRatio >= 0.7 else { continue }
+            let score = dist / gate + 0.5 * (1 - volRatio)
+            if score > 1.5 { continue }
+            if best == nil || score < best!.score {
+                best = (i, score, g)
+            }
+        }
+        guard let chosen = best else { return nil }
+        return (chosen.idx, chosen.entry)
     }
 
     /// Update an existing track with a new observation. Size is frozen on

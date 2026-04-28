@@ -41,6 +41,7 @@ Chronological event log: [log.md](log.md).
 - [concepts/dual-palette-swap.md](concepts/dual-palette-swap.md) — ghost↔solid material swap.
 - [concepts/spring-tween.md](concepts/spring-tween.md) — critically damped MOT tween.
 - [concepts/track-hysteresis.md](concepts/track-hysteresis.md) — provisional vs confirmed tracks.
+- [concepts/mot-graveyard.md](concepts/mot-graveyard.md) — short-occlusion UUID stitching (Step 3.14).
 - [concepts/rotation-1axis.md](concepts/rotation-1axis.md) — why we only rotate on yaw.
 - [concepts/offscreen-arrow.md](concepts/offscreen-arrow.md) — edge-clamped pointer to selected object.
 - [concepts/stream-mode.md](concepts/stream-mode.md) — continuous detection loop.
