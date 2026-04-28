@@ -24,7 +24,20 @@ struct ARViewContainer: UIViewRepresentable {
 
         // Configure AR session with LiDAR.
         let config = ARWorldTrackingConfiguration()
-        config.frameSemantics = [.sceneDepth]
+        // .sceneDepth is per-frame raw LiDAR; .smoothedSceneDepth is the
+        // multi-frame temporally-fused version. On a stationary device
+        // the raw depth occasionally returns nil for runs of frames
+        // (ARKit drops single-frame depth when LiDAR/vSLAM fusion can't
+        // reach high confidence — most often when the user has the
+        // phone on a tripod with no motion at all). Smoothed depth
+        // holds a fused buffer across recent frames, so we fall back
+        // to it whenever the per-frame is missing. Cost is negligible
+        // on A17.
+        if ARWorldTrackingConfiguration.supportsFrameSemantics([.sceneDepth, .smoothedSceneDepth]) {
+            config.frameSemantics = [.sceneDepth, .smoothedSceneDepth]
+        } else {
+            config.frameSemantics = [.sceneDepth]
+        }
         // Plane detection drives the Tesla "feel the road" dot overlay in FSD
         // mode — clean flat planes from ARKit beat the raw jagged scene-recon
         // mesh on floors / tables / walls. Horizontal = floors + tables + seat

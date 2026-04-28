@@ -224,7 +224,11 @@ final class ARViewModel: NSObject, ObservableObject {
               let boxerNet, let yoloDetector else {
             status = "Not ready"; return
         }
-        guard frame.sceneDepth != nil else {
+        // Prefer smoothedSceneDepth (multi-frame fused) over the raw
+        // per-frame sceneDepth — ARKit occasionally returns nil for the
+        // raw stream during stationary periods (Tripod / desk-rest),
+        // while the smoothed buffer carries depth across the gap.
+        guard frame.smoothedSceneDepth != nil || frame.sceneDepth != nil else {
             status = "No LiDAR depth"; return
         }
 
@@ -575,7 +579,11 @@ final class ARViewModel: NSObject, ObservableObject {
         // 1. Preprocess in parallel: two image resizes + depth extraction are
         //    independent and CPU-bound on different data.
         let capturedImage = frame.capturedImage
-        let sceneDepthMap = frame.sceneDepth!.depthMap
+        // Smoothed > raw — see ARViewContainer.swift comment on
+        // frame semantics. The detectNow() guard already verified at
+        // least one of these is non-nil, so the bang is safe even if
+        // the raw stream blinked since.
+        let sceneDepthMap = (frame.smoothedSceneDepth ?? frame.sceneDepth!).depthMap
         async let boxerImageT = Task.detached(priority: .userInitiated) {
             pixelBufferToFloatArray(capturedImage, targetSize: BoxerNet.imageSize).0
         }.value
