@@ -1,6 +1,6 @@
 ---
 title: Boxer3D wiki — log
-updated: 2026-04-28
+updated: 2026-05-02
 ---
 
 # Log
@@ -11,6 +11,30 @@ Append-only. Newest on top. Format: `## [YYYY-MM-DD] <kind> | <title>`.
 Grep: `grep "^## \[" wiki/log.md | head -20`.
 
 ---
+
+## [2026-04-28] ship | Step 3.15 — smoothedSceneDepth fallback for stationary device
+
+User saw "No LiDAR depth" status appear after the phone sat still on a
+desk for a few minutes. Root cause: ARKit's per-frame `.sceneDepth`
+blinks nil for runs of frames when LiDAR/vSLAM fusion can't reach high
+confidence — most often during sustained no-motion (no parallax cues
+for vSLAM). The LiDAR hardware itself isn't sleeping; ARKit just
+doesn't expose a fused depth on those frames.
+
+Two changes in `boxer/ARViewContainer.swift` + `boxer/ARViewModel.swift`:
+
+1. ARViewContainer requests `[.sceneDepth, .smoothedSceneDepth]` (with
+   `ARWorldTrackingConfiguration.supportsFrameSemantics` guard so old
+   devices that lack the smoothed mode still work).
+2. detectNow guard accepts either source; runPipeline depth pull
+   prefers `smoothedSceneDepth ?? sceneDepth`. The smoothed variant
+   carries a temporally-fused depth buffer across the gaps where the
+   raw stream blinks.
+
+Negligible cost on A17 — LiDAR runs at 60 Hz regardless; the smoothed
+buffer just exposes an existing fused output. Commit `7982e8d`.
+
+Touched: `boxer/ARViewContainer.swift`, `boxer/ARViewModel.swift`.
 
 ## [2026-04-28] ship | Step 3.14 — MOT tracklet graveyard (UUID stitching)
 
